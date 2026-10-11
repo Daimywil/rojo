@@ -23,6 +23,7 @@ local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local Selection = game:GetService("Selection")
+local ServerStorage = game:GetService("ServerStorage")
 
 local Packages = script.Parent.Parent.Packages
 local Log = require(Packages.Log)
@@ -55,6 +56,26 @@ local FRAME_WORK_BUDGET = 0.008
 -- Unpublished places all have the place ID 0, so they're told apart by a key
 -- stored in the place.
 local LOCAL_PLACE_ATTRIBUTE = "__RojoAssetSyncPlace"
+
+--[[
+	Reads an attribute that asset sync stores in the place. They're kept in
+	ServerStorage, which unlike Workspace is never sent to players, but older
+	versions kept them in Workspace, so that's checked too.
+]]
+local function getPlaceAttribute(name: string): any
+	local value = ServerStorage:GetAttribute(name)
+	if value == nil then
+		value = workspace:GetAttribute(name)
+	end
+	return value
+end
+
+local function setPlaceAttribute(name: string, value: any)
+	ServerStorage:SetAttribute(name, value)
+	if workspace:GetAttribute(name) ~= nil then
+		workspace:SetAttribute(name, nil)
+	end
+end
 
 local function errorToString(err): string
 	if typeof(err) == "table" and err.message ~= nil then
@@ -221,10 +242,12 @@ function AssetSync:__start()
 	end
 
 	if game.PlaceId == 0 then
-		local key = workspace:GetAttribute(LOCAL_PLACE_ATTRIBUTE)
+		local key = getPlaceAttribute(LOCAL_PLACE_ATTRIBUTE)
 		if typeof(key) ~= "string" then
 			key = HttpService:GenerateGUID(false)
-			workspace:SetAttribute(LOCAL_PLACE_ATTRIBUTE, key)
+		end
+		if ServerStorage:GetAttribute(LOCAL_PLACE_ATTRIBUTE) ~= key then
+			setPlaceAttribute(LOCAL_PLACE_ATTRIBUTE, key)
 		end
 		self.__placeId = "local-" .. key
 	end
@@ -232,7 +255,7 @@ function AssetSync:__start()
 	-- The token of the session that synced this place last, if the place was
 	-- saved after it. See src/assets/state.rs.
 	self.__sessionAttribute = info.sessionAttribute
-	local storedSession = workspace:GetAttribute(info.sessionAttribute)
+	local storedSession = getPlaceAttribute(info.sessionAttribute)
 	self.__placeSession = if typeof(storedSession) == "string" then storedSession else nil
 
 	for _, containerInfo in info.containers do
@@ -296,7 +319,7 @@ function AssetSync:__start()
 			session = self.__clientId,
 		})
 		:expect()
-	workspace:SetAttribute(self.__sessionAttribute, self.__clientId)
+	setPlaceAttribute(self.__sessionAttribute, self.__clientId)
 
 	self.__running = true
 	self:__connectListeners()

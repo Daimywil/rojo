@@ -290,7 +290,7 @@ pub struct AssetsResponse {
 
     pub containers: Vec<AssetContainer>,
 
-    /// The name of the attribute of Workspace that stores the token of the
+    /// The name of the attribute of ServerStorage that stores the token of the
     /// last session that synced the place's assets.
     pub session_attribute: String,
 }
