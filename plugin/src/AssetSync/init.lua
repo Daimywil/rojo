@@ -138,7 +138,9 @@ function AssetSync.new(options)
 		__lastFsChangeAt = 0,
 		__running = false,
 		__sweepQueue = {},
+		__sweepBudget = 0,
 		__layoutSweepQueue = {},
+		__layoutSweepBudget = 0,
 		__retryAt = 0,
 
 		-- What __locate found for instances this frame, by instance. See
@@ -1348,7 +1350,15 @@ function AssetSync:__connectListeners()
 
 	-- Tags don't fire ItemChanged either, but CollectionService can tell us
 	-- about every tag that's added or removed.
+	local connectedTags = {}
 	local function connectTag(tag: string)
+		-- A tag that stops being used and is used again fires TagAdded again,
+		-- while its signals are still connected.
+		if connectedTags[tag] then
+			return
+		end
+		connectedTags[tag] = true
+
 		table.insert(
 			self.__connections,
 			CollectionService:GetInstanceAddedSignal(tag):Connect(function(instance)
@@ -1366,7 +1376,19 @@ function AssetSync:__connectListeners()
 	for _, tag in CollectionService:GetAllTags() do
 		connectTag(tag)
 	end
-	table.insert(self.__connections, CollectionService.TagAdded:Connect(connectTag))
+	table.insert(
+		self.__connections,
+		CollectionService.TagAdded:Connect(function(tag)
+			connectTag(tag)
+
+			-- TagAdded only fires for a tag the game didn't use yet once
+			-- something has it, which is too late for the signals connected
+			-- above to report that.
+			for _, instance in CollectionService:GetTagged(tag) do
+				self:__onInstanceChanged(instance, nil)
+			end
+		end)
+	)
 
 	-- Attributes of an asset's descendants are almost always edited in the
 	-- Properties window, which edits the selection, so listening to the
@@ -1876,7 +1898,13 @@ function AssetSync:__sweepStep(interval: number)
 		self.__sweepTotal = #self.__sweepQueue
 	end
 
-	local count = math.ceil((self.__sweepTotal or 0) * interval / (self.__sweepPeriod or SWEEP_PERIOD))
+	-- Fractions of an asset carry over to the next step. Rounding up instead
+	-- would check one asset every step, so a container with only a few assets
+	-- would be checked over and over.
+	self.__sweepBudget += (self.__sweepTotal or 0) * interval / (self.__sweepPeriod or SWEEP_PERIOD)
+	local count = math.floor(self.__sweepBudget)
+	self.__sweepBudget -= count
+
 	local items, instances = {}, {}
 
 	while #items < count and #self.__sweepQueue > 0 do
@@ -1924,8 +1952,11 @@ function AssetSync:__layoutSweepStep(interval: number)
 		self.__layoutSweepTotal = #self.__layoutSweepQueue
 	end
 
+	-- Fractions carry over, like in __sweepStep.
 	local period = self.__layoutSweepPeriod or LAYOUT_SWEEP_PERIOD
-	local count = math.ceil((self.__layoutSweepTotal or 0) * interval / period)
+	self.__layoutSweepBudget += (self.__layoutSweepTotal or 0) * interval / period
+	local count = math.floor(self.__layoutSweepBudget)
+	self.__layoutSweepBudget -= count
 
 	for _ = 1, count do
 		local item = table.remove(self.__layoutSweepQueue)
