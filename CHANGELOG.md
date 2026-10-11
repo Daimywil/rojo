@@ -35,6 +35,7 @@ Making a new release? Simply add the new header with the version and date undern
 * Added two-way asset sync with `$assets`. The children of an instance declared with `"$assets": "some/dir"` are mirrored to that directory, where plain folders become directories and every other instance becomes one `.rbxm` file. Edits made in Studio are written to the files within a second, and changes to the files, such as `git checkout`, are applied in Studio, so assets can be versioned and rolled back with git. Assets are moved as Studio's own binary models, so every property, including meshes, unions, and surface appearances, is kept. `rojo build` includes them too.
 * Other tools, such as Studio's MCP, can ask the plugin to connect by setting the `RojoConnectRequest` attribute of `CoreGui` to `true` or a port. The plugin says what came of it in the `RojoConnectResult` attribute. These connections skip the sync confirmation, but asset conflicts still wait for the user.
 * The port a place last connected to is now saved in the place, and filled in when it is opened again.
+* Fixed HTTP errors whose text contains `%`, like GitHub's error pages, raising an unrelated error that hid them.
 
 [#1333]: https://github.com/rojo-rbx/rojo/pull/1333
 

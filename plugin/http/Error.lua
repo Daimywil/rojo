@@ -26,7 +26,11 @@ setmetatable(Error.Kind, {
 
 function Error.new(type, extraMessage)
 	extraMessage = extraMessage or ""
-	local message = type.message:gsub("{{message}}", extraMessage)
+	-- Replaced with a function, since gsub reads % in a replacement string as a
+	-- capture, and messages like response bodies can contain any text.
+	local message = type.message:gsub("{{message}}", function()
+		return extraMessage
+	end)
 
 	local err = {
 		type = type,
