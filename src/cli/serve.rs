@@ -49,6 +49,10 @@ impl ServeCommand {
 
         let session = Arc::new(ServeSession::new(vfs, project_path)?);
 
+        // Index asset directories up front, so the first sync doesn't have to
+        // wait for it, and so they're watched from the start.
+        session.asset_store().scan_all()?;
+
         let ip = self
             .address
             .or_else(|| session.serve_address())

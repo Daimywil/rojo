@@ -1,4 +1,5 @@
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local CoreGui = game:GetService("CoreGui")
 local Players = game:GetService("Players")
 local ServerStorage = game:GetService("ServerStorage")
 local RunService = game:GetService("RunService")
@@ -42,6 +43,7 @@ local AppStatus = strict("AppStatus", {
 	Settings = "Settings",
 	Connecting = "Connecting",
 	Confirming = "Confirming",
+	AssetConflicts = "AssetConflicts",
 	Connected = "Connected",
 	Error = "Error",
 })
@@ -55,10 +57,11 @@ function App:init()
 
 	local priorSyncInfo = self:getPriorSyncInfo()
 	self.host, self.setHost = Roact.createBinding(priorSyncInfo.host or "")
-	self.port, self.setPort = Roact.createBinding(priorSyncInfo.port or "")
+	self.port, self.setPort = Roact.createBinding(self:getLastConnectionPort() or priorSyncInfo.port or "")
 
 	self.confirmationBindable = Instance.new("BindableEvent")
 	self.confirmationEvent = self.confirmationBindable.Event
+	self.assetDecisionBindable = Instance.new("BindableEvent")
 	self.knownProjects = {}
 	self.notifId = 0
 
@@ -149,7 +152,9 @@ function App:init()
 			end
 		end)
 
-		self:tryAutoReconnect():andThen(function(didReconnect)
+		-- Kept so a connect request can wait for it instead of starting a second session alongside it
+		self.autoReconnect = self:tryAutoReconnect()
+		self.autoReconnect:andThen(function(didReconnect)
 			if not didReconnect then
 				self:checkSyncReminder()
 			end
@@ -171,13 +176,31 @@ function App:init()
 			self:clearRunningConnectionInfo()
 		end
 	end)
+
+	-- Other tools ask for a connection by setting the RojoConnectRequest attribute of CoreGui to true or a port, and
+	-- read what came of it from the RojoConnectResult attribute. An attribute is used because a thread with fewer
+	-- capabilities than this plugin, such as Studio's MCP, may not invoke a bindable of ours.
+	-- CoreGui is local to this Studio, so Team Create collaborators never see the request
+	CoreGui:SetAttribute("RojoConnectRequest", nil)
+	self.connectRequestConnection = CoreGui:GetAttributeChangedSignal("RojoConnectRequest"):Connect(function()
+		local request = CoreGui:GetAttribute("RojoConnectRequest")
+		if request == nil then
+			return
+		end
+
+		-- Cleared so that asking for the same port again still changes the attribute
+		CoreGui:SetAttribute("RojoConnectRequest", nil)
+		CoreGui:SetAttribute("RojoConnectResult", self:handleConnectRequest(request))
+	end)
 end
 
 function App:willUnmount()
 	self:endSession()
 
 	self.waypointConnection:Disconnect()
+	self.connectRequestConnection:Disconnect()
 	self.confirmationBindable:Destroy()
+	self.assetDecisionBindable:Destroy()
 
 	self.disconnectUpdatesCheckChanged()
 	self.disconnectPrereleasesCheckChanged()
@@ -312,6 +335,24 @@ function App:forgetPriorSyncInfo()
 	Log.trace("Erased last used endpoint for {}", game.PlaceId)
 
 	Settings:set("priorEndpoints", priorSyncInfos)
+end
+
+-- The last port this place connected to is saved in the place itself, so it is shared by everyone who opens it
+local LAST_CONNECTION_PORT_ATTRIBUTE = "__RojoLastConnectionPort"
+
+function App:getLastConnectionPort(): string?
+	local port = ServerStorage:GetAttribute(LAST_CONNECTION_PORT_ATTRIBUTE)
+	if typeof(port) == "number" or (typeof(port) == "string" and #port > 0) then
+		return tostring(port)
+	end
+	return nil
+end
+
+function App:setLastConnectionPort(port: string)
+	if ServerStorage:GetAttribute(LAST_CONNECTION_PORT_ATTRIBUTE) == port then
+		return
+	end
+	ServerStorage:SetAttribute(LAST_CONNECTION_PORT_ATTRIBUTE, port)
 end
 
 function App:getHostAndPort()
@@ -600,10 +641,58 @@ function App:useRunningConnectionInfo()
 	self.setPort(port)
 end
 
-function App:startSession()
+local function syncLockTakenMessage(owner: Player?): string
+	return string.format("Could not sync because user '%s' is already syncing", tostring(owner))
+end
+
+-- Returns what came of the request, since the tool that asked can't see the Rojo panel
+function App:handleConnectRequest(request: any): string
+	-- true connects to the port in the panel, a number connects to that port
+	local isPort = typeof(request) == "number" and request % 1 == 0 and request >= 1 and request <= 65535
+	if request ~= true and not isPort then
+		Log.warn("Ignoring connect request because {} is neither true nor a port", request)
+		return `Ignored: {request} is neither true nor a port`
+	end
+
+	if self.autoReconnect ~= nil then
+		self.autoReconnect:await()
+	end
+
+	-- Same check as the "Rojo: Connect" action, so a running session is never replaced
+	if self.serveSession ~= nil and self.serveSession:getStatus() ~= ServeSession.Status.NotStarted then
+		Log.trace("Ignoring connect request because a session is already running")
+		if self.serveSession:getStatus() == ServeSession.Status.Connected then
+			return `Already connected to '{self.state.projectName}' at {self.state.address}`
+		end
+		return "Already connecting to a session"
+	end
+
+	if isPort then
+		self.setPort(tostring(request))
+	end
+
+	-- Showing a notification yields until its text is measured, which can take over ten seconds while a Studio that
+	-- just opened loads its fonts. So the session starts on its own thread, and the answer is worked out here rather
+	-- than waiting for startSession, which shows a notification before it could tell whether it claimed the lock.
+	local lockAvailable, lockOwner = self:isSyncLockAvailable()
+
+	Log.trace("Connecting because a connect request asked for {}", request)
+	-- The tool that asked can't answer the sync confirmation, so it is skipped. Asset conflicts are still left to
+	-- the user, since either answer to them can overwrite someone's work.
+	task.spawn(self.startSession, self, true)
+
+	if not lockAvailable then
+		return syncLockTakenMessage(lockOwner)
+	end
+
+	local host, port = self:getHostAndPort()
+	return `Connecting to {host}:{port}`
+end
+
+function App:startSession(skipConfirmation: boolean?)
 	local claimedLock, priorOwner = self:claimSyncLock()
 	if not claimedLock then
-		local msg = string.format("Could not sync because user '%s' is already syncing", tostring(priorOwner))
+		local msg = syncLockTakenMessage(priorOwner)
 
 		Log.warn(msg)
 		self:addNotification({
@@ -687,6 +776,7 @@ function App:startSession()
 		elseif status == ServeSession.Status.Connected then
 			self.knownProjects[details] = true
 			self:setPriorSyncInfo(host, port, details)
+			self:setLastConnectionPort(port)
 			self:setRunningConnectionInfo(baseUrl)
 
 			local address = ("%s:%s"):format(host, port)
@@ -747,6 +837,12 @@ function App:startSession()
 		-- Play solo auto-connect does not require confirmation
 		if self:isAutoConnectPlaytestServerAvailable() then
 			Log.trace("Accepting patch without confirmation because play solo auto-connect is enabled")
+			return "Accept"
+		end
+
+		-- Connections requested through the RojoConnectRequest attribute of CoreGui do not require confirmation
+		if skipConfirmation then
+			Log.trace("Accepting patch without confirmation because a connect request asked for the connection")
 			return "Accept"
 		end
 
@@ -824,9 +920,43 @@ function App:startSession()
 		return self.confirmationEvent:Wait()
 	end)
 
-	serveSession:start()
+	serveSession:setAssetConfirmCallback(function(summary)
+		self:setState({
+			appStatus = AppStatus.AssetConflicts,
+			assetSummary = summary,
+			toolbarIcon = Assets.Images.PluginButton,
+		})
 
+		self:addNotification({
+			text = if #summary.conflicts > 0
+				then "Some assets differ between Studio and the files. Please pick which side to keep."
+				else "Please confirm the first asset sync for this place.",
+			timeout = 7,
+		})
+
+		local decision = self.assetDecisionBindable.Event:Wait()
+
+		if decision ~= "Abort" then
+			self:setState({
+				appStatus = AppStatus.Connecting,
+			})
+		end
+
+		return decision
+	end)
+
+	serveSession:setAssetNotifyCallback(function(text)
+		self:addNotification({
+			text = text,
+			timeout = 7,
+		})
+	end)
+
+	-- Set before starting, since starting yields while it shows a notification, and anything that checks for a
+	-- running session in the meantime, like a connect request, has to find this one
 	self.serveSession = serveSession
+
+	serveSession:start()
 end
 
 function App:endSession()
@@ -835,6 +965,11 @@ function App:endSession()
 	end
 
 	Log.trace("Disconnecting session")
+
+	-- Don't leave asset sync waiting on a decision that will never come.
+	if self.state.appStatus == AppStatus.AssetConflicts then
+		self.assetDecisionBindable:Fire("Abort")
+	end
 
 	self.serveSession:stop()
 	self.serveSession = nil
@@ -929,6 +1064,14 @@ function App:render()
 						end,
 						onReject = function()
 							self.confirmationBindable:Fire("Reject")
+						end,
+					}),
+
+					AssetConflictsPage = createPageElement(AppStatus.AssetConflicts, {
+						summary = self.state.assetSummary,
+
+						onDecision = function(decision)
+							self.assetDecisionBindable:Fire(decision)
 						end,
 					}),
 

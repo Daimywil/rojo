@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, VecDeque},
-    path::Path,
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{bail, Context};
@@ -13,6 +13,7 @@ use rbx_dom_weak::{
 use rbx_reflection::ClassTag;
 
 use crate::{
+    glob::IgnorableGlob,
     project::{PathNode, Project, ProjectNode},
     resolution::UnresolvedValue,
     snapshot::{
@@ -55,6 +56,7 @@ pub fn snapshot_project(
 
     context.add_sync_rules(sync_rules);
     context.add_path_ignore_rules(rules);
+    context.add_path_ignore_rules(asset_dir_ignore_rules(&project));
     context.set_emit_legacy_scripts(
         project
             .emit_legacy_scripts
@@ -87,6 +89,56 @@ pub fn snapshot_project(
         }
         None => Ok(None),
     }
+}
+
+/// Lexically removes `.` and `..` components from a path, so that the same
+/// directory always has the same path no matter how a project spelled it.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component);
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+
+    normalized
+}
+
+/// Asset directories are synced by the asset store, so the snapshot system
+/// has to skip them if they're inside of a directory used with `$path`.
+fn asset_dir_ignore_rules(project: &Project) -> Vec<PathIgnoreRule> {
+    fn collect(folder: &Path, node: &ProjectNode, rules: &mut Vec<PathIgnoreRule>) {
+        if let Some(assets) = &node.assets {
+            let dir = normalize_path(&folder.join(assets));
+            if let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) {
+                let pattern = globset::escape(&name.to_string_lossy());
+                match IgnorableGlob::new(&pattern) {
+                    Ok(glob) => rules.push(PathIgnoreRule {
+                        base_path: parent.to_path_buf(),
+                        glob,
+                    }),
+                    Err(err) => {
+                        log::warn!("Could not ignore asset directory {}: {err}", dir.display())
+                    }
+                }
+            }
+        }
+
+        for child in node.children.values() {
+            collect(folder, child, rules);
+        }
+    }
+
+    let mut rules = Vec::new();
+    collect(project.folder_location(), &project.tree, &mut rules);
+    rules
 }
 
 pub fn snapshot_project_node(
@@ -290,6 +342,22 @@ pub fn snapshot_project_node(
         metadata.ignore_unknown_instances = true;
     }
 
+    if let Some(assets) = &node.assets {
+        // The children of an asset container are synced by the asset store
+        // rather than the snapshot system, so the snapshot system must never
+        // delete them.
+        if node.ignore_unknown_instances == Some(false) {
+            log::warn!(
+                "$ignoreUnknownInstances cannot be false for \"{}\" because it uses $assets. Ignoring it.\n\
+                 Project path: {}",
+                instance_name,
+                project_path.display()
+            );
+        }
+        metadata.ignore_unknown_instances = true;
+        metadata.asset_dir = Some(normalize_path(&project_folder.join(assets)));
+    }
+
     if let Some(id) = &node.id {
         metadata.specified_id = Some(RojoRef::new(id.clone()))
     }
@@ -297,7 +365,7 @@ pub fn snapshot_project_node(
     metadata.instigating_source = Some(InstigatingSource::ProjectNode {
         path: project_path.to_path_buf(),
         name: instance_name.to_string(),
-        node: node.clone(),
+        node: Box::new(node.clone()),
         parent_class: parent_class.map(|name| name.to_owned()),
     });
 

@@ -105,6 +105,10 @@ pathdiff = "0.2.3"
 
 blake3 = "1.5.0"
 float-cmp = "0.9.0"
+# Already used by rbx_binary. Asset sync needs them directly to rewrite model
+# chunks without decoding (and potentially losing) their contents.
+lz4_flex = "0.13.1"
+zstd = "0.13.3"
 indexmap = { version = "2.10.0", features = ["serde"] }
 rmp-serde = "1.3.0"
 serde_bytes = "0.11.19"

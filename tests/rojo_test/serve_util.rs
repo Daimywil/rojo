@@ -10,13 +10,13 @@ use std::{
 use hyper_tungstenite::tungstenite::{connect, Message};
 use rbx_dom_weak::types::Ref;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tempfile::{tempdir, TempDir};
 
 use librojo::{
     web_api::{
-        ReadResponse, SerializeRequest, SerializeResponse, ServerInfoResponse, SocketPacket,
-        SocketPacketType,
+        AssetsResponse, AssetsSocketPacket, ReadResponse, SerializeRequest, SerializeResponse,
+        ServerInfoResponse, SocketPacket, SocketPacketType,
     },
     SessionId,
 };
@@ -242,6 +242,73 @@ impl TestServeSession {
         .unwrap();
 
         client.post(url).body(body).send()
+    }
+
+    pub fn get_api_assets(&self) -> Result<AssetsResponse, reqwest::Error> {
+        let url = format!("http://localhost:{}/api/assets", self.port);
+        let body = reqwest::blocking::get(url)?.bytes()?;
+
+        Ok(deserialize_msgpack(&body).expect("Server returned malformed response"))
+    }
+
+    /// Sends a request to one of the `/api/assets/*` endpoints and decodes the
+    /// response, panicking if the server returned an error.
+    pub fn post_api_assets<Req: Serialize, Res: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        request: &Req,
+    ) -> Res {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://localhost:{}/api/assets/{}", self.port, endpoint);
+        let response = client
+            .post(url)
+            .body(serialize_msgpack(request).unwrap())
+            .send()
+            .expect("Failed to send request");
+
+        let status = response.status();
+        let body = response.bytes().expect("Failed to read response");
+        assert!(
+            status.is_success(),
+            "/api/assets/{endpoint} failed with {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        deserialize_msgpack(&body).expect("Server returned malformed response")
+    }
+
+    /// Waits for the first packet from `/api/assets/socket` that reports a
+    /// change to an asset file.
+    pub fn get_api_assets_socket_change(
+        &self,
+        cursor: u32,
+    ) -> Result<AssetsSocketPacket, Box<dyn std::error::Error>> {
+        let url = format!("ws://localhost:{}/api/assets/socket/{}", self.port, cursor);
+        let (mut socket, _response) = connect(url)?;
+
+        let timeout = Duration::from_secs(10);
+        let start = std::time::Instant::now();
+
+        loop {
+            if start.elapsed() > timeout {
+                return Err("Timeout waiting for an asset change".into());
+            }
+
+            match socket.read() {
+                Ok(Message::Binary(binary)) => {
+                    let packet: AssetsSocketPacket = deserialize_msgpack(&binary)?;
+                    if !packet.changes.is_empty() {
+                        let _ = socket.close(None);
+                        return Ok(packet);
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    return Err("WebSocket closed before receiving messages".into());
+                }
+                Ok(_) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// Sends a GET to `/api/rojo` with the given extra request headers and

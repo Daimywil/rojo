@@ -2088,6 +2088,7 @@ dependencies = [
  "jod-thread",
  "jsonc-parser",
  "log",
+ "lz4_flex",
  "maplit",
  "memofs",
  "num_cpus",
@@ -2122,6 +2123,7 @@ dependencies = [
  "walkdir",
  "winreg 0.10.1",
  "yaml-rust2",
+ "zstd",
 ]
 
 [[package]]

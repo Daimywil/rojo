@@ -70,6 +70,15 @@ pub struct InstanceMetadata {
     /// A schema provided via a JSON file, if one exists. Will be `None` for
     /// all non-JSON middleware.
     pub schema: Option<String>,
+
+    /// The directory this instance's children are synced with as assets, if
+    /// it was declared with `$assets` in a project file.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "path_serializer::serialize_option_absolute"
+    )]
+    pub asset_dir: Option<PathBuf>,
 }
 
 impl InstanceMetadata {
@@ -82,6 +91,7 @@ impl InstanceMetadata {
             specified_id: None,
             middleware: None,
             schema: None,
+            asset_dir: None,
         }
     }
 
@@ -129,6 +139,10 @@ impl InstanceMetadata {
 
     pub fn schema(self, schema: Option<String>) -> Self {
         Self { schema, ..self }
+    }
+
+    pub fn asset_dir(self, asset_dir: Option<PathBuf>) -> Self {
+        Self { asset_dir, ..self }
     }
 }
 
@@ -265,7 +279,8 @@ pub enum InstigatingSource {
         #[serde(serialize_with = "path_serializer::serialize_absolute")]
         path: PathBuf,
         name: String,
-        node: ProjectNode,
+        // Boxed because project nodes are much larger than the other variant.
+        node: Box<ProjectNode>,
         parent_class: Option<String>,
     },
 }

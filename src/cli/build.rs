@@ -7,11 +7,12 @@ use std::{
 use anyhow::{bail, Context};
 use clap::{CommandFactory, Parser};
 use fs_err::File;
+use futures::future::Either;
 use memofs::Vfs;
 use roblox_install::RobloxStudio;
 use tokio::runtime::Runtime;
 
-use crate::serve_session::ServeSession;
+use crate::{assets::dom_with_assets, serve_session::ServeSession};
 
 use super::resolve_path;
 
@@ -83,6 +84,12 @@ impl BuildCommand {
 
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
+        let mut asset_cursor = session.asset_store().messages().cursor();
+
+        if self.watch {
+            // Asset directories are only watched once they've been scanned.
+            session.asset_store().scan_all()?;
+        }
 
         write_model(&session, &output_path, output_kind)?;
 
@@ -90,14 +97,26 @@ impl BuildCommand {
             let rt = Runtime::new().context("Failed to start the async runtime for watch mode")?;
 
             loop {
-                let receiver = session.message_queue().subscribe(cursor);
-                let (new_cursor, _patch_set) = match rt.block_on(receiver) {
-                    Ok(message) => message,
-                    // The message queue was dropped, so there is nothing left
-                    // to watch. Stop watching gracefully.
-                    Err(_) => break,
-                };
-                cursor = new_cursor;
+                let patches = session.message_queue().subscribe(cursor);
+                let assets = session.asset_store().messages().subscribe(asset_cursor);
+
+                // Rebuild when either the instance tree or an asset changes.
+                let changed = rt.block_on(async {
+                    match futures::future::select(patches, assets).await {
+                        Either::Left((result, _)) => result.map(|(new_cursor, _)| {
+                            cursor = new_cursor;
+                        }),
+                        Either::Right((result, _)) => result.map(|(new_cursor, _)| {
+                            asset_cursor = new_cursor;
+                        }),
+                    }
+                });
+
+                // A message queue was dropped, so there is nothing left to
+                // watch. Stop watching gracefully.
+                if changed.is_err() {
+                    break;
+                }
 
                 write_model(&session, &output_path, output_kind)?;
             }
@@ -164,35 +183,38 @@ fn write_model(
     println!("Building project '{}'", session.project_name());
 
     let tree = session.tree();
-    let root_id = tree.get_root_id();
+
+    // Assets aren't part of the tree, so projects with asset directories are
+    // built from a copy of the tree that has them added.
+    let with_assets = dom_with_assets(&tree, session.asset_store())?;
+    let dom = with_assets.as_ref().unwrap_or_else(|| tree.inner());
+    let root_id = dom.root_ref();
 
     log::trace!("Opening output file for write");
     let mut file = BufWriter::new(File::create(output)?);
 
     match output_kind {
         OutputKind::Rbxm => {
-            rbx_binary::to_writer(&mut file, tree.inner(), &[root_id])?;
+            rbx_binary::to_writer(&mut file, dom, &[root_id])?;
         }
         OutputKind::Rbxl => {
-            let root_instance = tree.get_instance(root_id).unwrap();
-            let top_level_ids = root_instance.children();
+            let top_level_ids = dom.root().children();
 
-            rbx_binary::to_writer(&mut file, tree.inner(), top_level_ids)?;
+            rbx_binary::to_writer(&mut file, dom, top_level_ids)?;
         }
         OutputKind::Rbxmx => {
             // Model files include the root instance of the tree and all its
             // descendants.
 
-            rbx_xml::to_writer(&mut file, tree.inner(), &[root_id], xml_encode_config())?;
+            rbx_xml::to_writer(&mut file, dom, &[root_id], xml_encode_config())?;
         }
         OutputKind::Rbxlx => {
             // Place files don't contain an entry for the DataModel, but our
             // WeakDom representation does.
 
-            let root_instance = tree.get_instance(root_id).unwrap();
-            let top_level_ids = root_instance.children();
+            let top_level_ids = dom.root().children();
 
-            rbx_xml::to_writer(&mut file, tree.inner(), top_level_ids, xml_encode_config())?;
+            rbx_xml::to_writer(&mut file, dom, top_level_ids, xml_encode_config())?;
         }
     }
 

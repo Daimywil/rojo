@@ -429,6 +429,19 @@ pub struct ProjectNode {
     /// spreadsheets (`.csv`).
     #[serde(rename = "$path", skip_serializing_if = "Option::is_none")]
     pub path: Option<PathNode>,
+
+    /// A directory that this instance's children are two-way synced with as
+    /// assets. Edits made in Roblox Studio are written to the directory, and
+    /// changes to the directory are applied in Studio.
+    ///
+    /// Children that are also described by this project are left alone.
+    #[serde(
+        rename = "$assets",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::path_serializer::serialize_option_absolute",
+        default
+    )]
+    pub assets: Option<PathBuf>,
 }
 
 impl ProjectNode {

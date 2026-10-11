@@ -1,0 +1,10 @@
+{
+  "name": "assets",
+  "tree": {
+    "$className": "DataModel",
+    "ServerStorage": {
+      "$className": "ServerStorage",
+      "$assets": "assets"
+    }
+  }
+}

@@ -12,6 +12,7 @@ use memofs::Vfs;
 use thiserror::Error;
 
 use crate::{
+    assets::AssetStore,
     change_processor::ChangeProcessor,
     message_queue::MessageQueue,
     project::{Project, ProjectError},
@@ -85,6 +86,10 @@ pub struct ServeSession {
     /// A channel to send mutation requests on. These will be handled by the
     /// ChangeProcessor and trigger changes in the tree.
     tree_mutation_sender: Sender<PatchSet>,
+
+    /// Keeps the asset directories declared with `$assets` in sync with
+    /// clients. Assets are not part of `tree`.
+    asset_store: Arc<AssetStore>,
 }
 
 impl ServeSession {
@@ -122,9 +127,16 @@ impl ServeSession {
         let session_id = SessionId::new();
         let message_queue = MessageQueue::new();
 
+        let vfs = Arc::new(vfs);
+
+        let asset_store = Arc::new(AssetStore::new(
+            root_project.folder_location(),
+            Some(Arc::clone(&vfs)),
+        ));
+        asset_store.refresh_containers(&tree);
+
         let tree = Arc::new(Mutex::new(tree));
         let message_queue = Arc::new(message_queue);
-        let vfs = Arc::new(vfs);
 
         let (tree_mutation_sender, tree_mutation_receiver) = crossbeam_channel::unbounded();
 
@@ -133,6 +145,7 @@ impl ServeSession {
             Arc::clone(&tree),
             Arc::clone(&vfs),
             Arc::clone(&message_queue),
+            Arc::clone(&asset_store),
             tree_mutation_receiver,
         );
 
@@ -145,6 +158,7 @@ impl ServeSession {
             message_queue,
             tree_mutation_sender,
             vfs,
+            asset_store,
         })
     }
 
@@ -167,6 +181,10 @@ impl ServeSession {
 
     pub fn message_queue(&self) -> &MessageQueue<AppliedPatchSet> {
         &self.message_queue
+    }
+
+    pub fn asset_store(&self) -> &AssetStore {
+        &self.asset_store
     }
 
     pub fn session_id(&self) -> SessionId {

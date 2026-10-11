@@ -29,6 +29,19 @@ where
 #[derive(Serialize)]
 struct WithAbsolute<'a>(#[serde(serialize_with = "serialize_absolute")] &'a Path);
 
+/// A serializer for serde that serializes an optional value with all directory
+/// separators converted into `/`.
+pub fn serialize_option_absolute<S, T>(path: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: AsRef<Path>,
+{
+    match path {
+        Some(path) => serializer.serialize_some(&WithAbsolute(path.as_ref())),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// A serializer for serde that serialize a list of values with all directory
 /// separators converted into `/`.
 pub fn serialize_vec_absolute<S, T>(paths: &[T], serializer: S) -> Result<S::Ok, S::Error>

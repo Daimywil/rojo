@@ -3,6 +3,7 @@ return {
 	Settings = require(script.Settings),
 	Connecting = require(script.Connecting),
 	Confirming = require(script.Confirming),
+	AssetConflicts = require(script.AssetConflicts),
 	Connected = require(script.Connected),
 	Error = require(script.Error),
 }

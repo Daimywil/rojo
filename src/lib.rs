@@ -7,6 +7,7 @@ pub mod cli;
 #[cfg(test)]
 mod tree_view;
 
+mod assets;
 mod auth_cookie;
 mod change_processor;
 mod glob;
@@ -28,6 +29,7 @@ mod web;
 
 // TODO: Work out what we should expose publicly
 
+pub use assets::{PlanAction as AssetPlanAction, PlanReason as AssetPlanReason};
 pub use project::*;
 pub use rojo_ref::*;
 pub use session_id::SessionId;

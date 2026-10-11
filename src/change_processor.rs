@@ -2,19 +2,25 @@ use crossbeam_channel::{select, Receiver, RecvError, Sender};
 use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
 use rbx_dom_weak::types::{Ref, Variant};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{
     fs,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use crate::{
+    assets::AssetStore,
     message_queue::MessageQueue,
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
     },
     snapshot_middleware::{snapshot_from_vfs, snapshot_project_node},
 };
+
+/// How often asset directories are checked for changes the file watcher
+/// missed.
+const ASSET_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Processes file change events, updates the DOM, and sends those updates
 /// through a channel for other stuff to consume.
@@ -50,14 +56,22 @@ impl ChangeProcessor {
         tree: Arc<Mutex<RojoTree>>,
         vfs: Arc<Vfs>,
         message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+        asset_store: Arc<AssetStore>,
         tree_mutation_receiver: Receiver<PatchSet>,
     ) -> Self {
         let (shutdown_sender, shutdown_receiver) = crossbeam_channel::bounded(1);
         let vfs_receiver = vfs.event_receiver();
+
+        // File watchers can drop events when huge numbers of files change at
+        // once, like during a git checkout. Rescanning asset directories every
+        // so often makes sure Studio still hears about every change.
+        let asset_rescan_ticker = crossbeam_channel::tick(ASSET_RESCAN_INTERVAL);
+
         let task = JobThreadContext {
             tree,
             vfs,
             message_queue,
+            asset_store,
         };
 
         let job_thread = jod_thread::Builder::new()
@@ -68,10 +82,17 @@ impl ChangeProcessor {
                 loop {
                     select! {
                         recv(vfs_receiver) -> event => {
-                            task.handle_vfs_event(event?);
+                            // Bursts of changes, like a git checkout, are handled
+                            // together so asset files can be read in parallel.
+                            let mut events = vec![event?];
+                            events.extend(vfs_receiver.try_iter());
+                            task.handle_vfs_events(events);
                         },
                         recv(tree_mutation_receiver) -> patch_set => {
                             task.handle_tree_event(patch_set?);
+                        },
+                        recv(asset_rescan_ticker) -> _ => {
+                            task.asset_store.rescan_all();
                         },
                         recv(shutdown_receiver) -> _ => {
                             log::trace!("ChangeProcessor shutdown signal received...");
@@ -111,6 +132,30 @@ struct JobThreadContext {
     /// Whenever changes are applied to the DOM, we should push those changes
     /// into this message queue to inform any connected clients.
     message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+
+    /// Handles changes inside of asset directories, which aren't part of the
+    /// DOM.
+    asset_store: Arc<AssetStore>,
+}
+
+/// Canonicalizes a path from a filesystem event even if it no longer exists,
+/// by canonicalizing its closest existing ancestor. Files in asset directories
+/// are written through temporary files, which are usually gone by the time
+/// their events arrive.
+fn canonicalize_event_path(vfs: &Vfs, path: &Path) -> Option<PathBuf> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+
+    loop {
+        if let Ok(canonical) = vfs.canonicalize(existing) {
+            let mut result = canonical;
+            result.extend(missing.iter().rev());
+            return Some(result);
+        }
+
+        missing.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
 }
 
 impl JobThreadContext {
@@ -157,14 +202,53 @@ impl JobThreadContext {
         applied_patches
     }
 
+    fn handle_vfs_events(&self, events: Vec<VfsEvent>) {
+        // Update the VFS immediately with the events.
+        for event in &events {
+            log::trace!("Vfs event: {:?}", event);
+            self.vfs
+                .commit_event(event)
+                .expect("Error applying VFS change");
+        }
+
+        let paths: Vec<PathBuf> = events
+            .iter()
+            .map(|event| match event {
+                VfsEvent::Create(path) | VfsEvent::Write(path) | VfsEvent::Remove(path) => {
+                    path.clone()
+                }
+                _ => PathBuf::new(),
+            })
+            .collect();
+
+        // The watcher reports asset files relative to the asset directory's
+        // canonical path, so they're usually matched without canonicalizing
+        // them. That saves opening every changed file, which is slow while
+        // antivirus software is still scanning it.
+        let mut owned = self.asset_store.handle_fs_changes(&paths);
+
+        let unmatched: Vec<usize> = (0..paths.len())
+            .filter(|&index| !owned[index] && !paths[index].as_os_str().is_empty())
+            .collect();
+        if !unmatched.is_empty() {
+            let canonical: Vec<PathBuf> = unmatched
+                .iter()
+                .map(|&index| canonicalize_event_path(&self.vfs, &paths[index]).unwrap_or_default())
+                .collect();
+            let owned_canonical = self.asset_store.handle_fs_changes(&canonical);
+            for (position, &index) in unmatched.iter().enumerate() {
+                owned[index] = owned_canonical[position];
+            }
+        }
+
+        for (event, owned) in events.into_iter().zip(owned) {
+            if !owned {
+                self.handle_vfs_event(event);
+            }
+        }
+    }
+
     fn handle_vfs_event(&self, event: VfsEvent) {
-        log::trace!("Vfs event: {:?}", event);
-
-        // Update the VFS immediately with the event.
-        self.vfs
-            .commit_event(&event)
-            .expect("Error applying VFS change");
-
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
         let applied_patches = match event {
@@ -184,6 +268,12 @@ impl JobThreadContext {
                 Vec::new()
             }
         };
+
+        if !applied_patches.is_empty() {
+            // The project file may have gained or lost `$assets` declarations.
+            let tree = self.tree.lock().unwrap();
+            self.asset_store.refresh_containers(&tree);
+        }
 
         // Notify anyone listening to the message queue about the changes we
         // just made.

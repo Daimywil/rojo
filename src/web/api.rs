@@ -12,14 +12,23 @@ use rbx_dom_weak::{
     InstanceBuilder, UstrMap, WeakDom,
 };
 
+use serde::{de::DeserializeOwned, Serialize};
+
 use crate::{
+    assets::{AckEntry, AssetMessage, Group, Hash, WriteOp},
     serve_session::ServeSession,
+    session_id::SessionId,
     snapshot::{InstanceWithMeta, PatchSet, PatchUpdate},
     web::{
         interface::{
-            ErrorResponse, Instance, MessagesPacket, OpenResponse, ReadResponse,
-            ServerInfoResponse, SocketPacket, SocketPacketBody, SocketPacketType, SubscribeMessage,
-            WriteRequest, WriteResponse, PROTOCOL_VERSION, SERVER_VERSION,
+            AssetContainer, AssetFile, AssetFileChange, AssetGroup, AssetPlanEntry, AssetSynced,
+            AssetWriteFailure, AssetsAckRequest, AssetsApplyRequest, AssetsGroupsRequest,
+            AssetsKnownRequest, AssetsKnownResponse, AssetsOkResponse, AssetsPlanRequest,
+            AssetsPlanResponse, AssetsReadRequest, AssetsReadResponse, AssetsResponse,
+            AssetsSessionRequest, AssetsSocketPacket, AssetsStageRequest, AssetsWriteRequest,
+            AssetsWriteResponse, ErrorResponse, Instance, MessagesPacket, OpenResponse,
+            ReadResponse, ServerInfoResponse, SocketPacket, SocketPacketBody, SocketPacketType,
+            SubscribeMessage, WriteRequest, WriteResponse, PROTOCOL_VERSION, SERVER_VERSION,
         },
         origin::canonical,
         util::{deserialize_msgpack, msgpack, msgpack_ok, serialize_msgpack},
@@ -60,6 +69,65 @@ pub async fn call(
             service.handle_api_open(request).await
         }
         (&Method::POST, "/api/write") => service.handle_api_write(request).await,
+
+        (&Method::GET, "/api/assets") => service.handle_api_assets().await,
+        (&Method::GET, path) if path.starts_with("/api/assets/socket/") => {
+            if is_upgrade_request(&request) {
+                service.handle_api_assets_socket(&mut request).await
+            } else {
+                msgpack(
+                    ErrorResponse::bad_request(
+                        "/api/assets/socket must be called as a websocket upgrade request",
+                    ),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        }
+        (&Method::POST, "/api/assets/plan") => {
+            service
+                .handle_assets_request(request, handle_assets_plan)
+                .await
+        }
+        (&Method::POST, "/api/assets/stage") => {
+            service
+                .handle_assets_request(request, handle_assets_stage)
+                .await
+        }
+        (&Method::POST, "/api/assets/apply") => {
+            service
+                .handle_assets_request(request, handle_assets_apply)
+                .await
+        }
+        (&Method::POST, "/api/assets/ack") => {
+            service
+                .handle_assets_request(request, handle_assets_ack)
+                .await
+        }
+        (&Method::POST, "/api/assets/write") => {
+            service
+                .handle_assets_request(request, handle_assets_write)
+                .await
+        }
+        (&Method::POST, "/api/assets/session") => {
+            service
+                .handle_assets_request(request, handle_assets_session)
+                .await
+        }
+        (&Method::POST, "/api/assets/read") => {
+            service
+                .handle_assets_request(request, handle_assets_read)
+                .await
+        }
+        (&Method::POST, "/api/assets/known") => {
+            service
+                .handle_assets_request(request, handle_assets_known)
+                .await
+        }
+        (&Method::POST, "/api/assets/groups") => {
+            service
+                .handle_assets_request(request, handle_assets_groups)
+                .await
+        }
 
         (_method, path) => msgpack(
             ErrorResponse::not_found(format!("Route not found: {}", path)),
@@ -135,6 +203,120 @@ impl ApiService {
         });
 
         response
+    }
+
+    /// Lists the asset directories that are synced into instances.
+    async fn handle_api_assets(&self) -> Response<Body> {
+        let asset_store = self.serve_session.asset_store();
+
+        // The cursor is read first so that no change made while the client
+        // syncs can slip by unnoticed.
+        let message_cursor = asset_store.messages().cursor();
+        let containers = asset_store
+            .containers()
+            .into_iter()
+            .map(|container| AssetContainer {
+                id: container.id,
+                path: container.key,
+            })
+            .collect();
+
+        msgpack_ok(AssetsResponse {
+            session_id: self.serve_session.session_id(),
+            message_cursor,
+            containers,
+            session_attribute: asset_store.session_attribute(),
+        })
+    }
+
+    /// Streams changes to asset files to the client.
+    async fn handle_api_assets_socket(&self, request: &mut Request<Body>) -> Response<Body> {
+        let argument = &request.uri().path()["/api/assets/socket/".len()..];
+        let input_cursor: u32 = match argument.parse() {
+            Ok(v) => v,
+            Err(err) => {
+                return msgpack(
+                    ErrorResponse::bad_request(format!("Malformed message cursor: {}", err)),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+
+        let (response, websocket) = match upgrade(request, None) {
+            Ok(result) => result,
+            Err(err) => {
+                return msgpack(
+                    ErrorResponse::internal_error(format!("WebSocket upgrade failed: {}", err)),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        };
+
+        let serve_session = Arc::clone(&self.serve_session);
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_assets_websocket(serve_session, websocket, input_cursor).await {
+                log::error!("Error in assets websocket subscription: {}", e);
+            }
+        });
+
+        response
+    }
+
+    /// Handles an asset sync request. The handler runs on a thread that is
+    /// allowed to block, since asset requests can read, hash, and write
+    /// thousands of files.
+    async fn handle_assets_request<Req, Res>(
+        &self,
+        request: Request<Body>,
+        handler: fn(&ServeSession, Req) -> anyhow::Result<Res>,
+    ) -> Response<Body>
+    where
+        Req: AssetsRequest + DeserializeOwned + Send + 'static,
+        Res: Serialize + Send + 'static,
+    {
+        let body = match body::to_bytes(request.into_body()).await {
+            Ok(body) => body,
+            Err(err) => {
+                return msgpack(
+                    ErrorResponse::bad_request(format!("Could not read body: {}", err)),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+
+        let request: Req = match deserialize_msgpack(&body) {
+            Ok(request) => request,
+            Err(err) => {
+                return msgpack(
+                    ErrorResponse::bad_request(format!("Invalid body: {}", err)),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+        drop(body);
+
+        if request.session_id() != self.serve_session.session_id() {
+            return msgpack(
+                ErrorResponse::bad_request("Wrong session ID"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+
+        let serve_session = Arc::clone(&self.serve_session);
+        let result = tokio::task::spawn_blocking(move || handler(&serve_session, request)).await;
+
+        match result {
+            Ok(Ok(response)) => msgpack_ok(response),
+            Ok(Err(err)) => msgpack(
+                ErrorResponse::internal_error(format!("{err:#}")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            Err(err) => msgpack(
+                ErrorResponse::internal_error(format!("Asset request failed: {err}")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        }
     }
 
     async fn handle_api_write(&self, request: Request<Body>) -> Response<Body> {
@@ -584,6 +766,356 @@ async fn handle_websocket_subscription(
                         log::debug!("WebSocket stream ended");
                         break;
                     }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// A request to one of the asset sync endpoints.
+trait AssetsRequest {
+    fn session_id(&self) -> SessionId;
+}
+
+macro_rules! impl_assets_request {
+    ($($request:ty),*) => {
+        $(impl AssetsRequest for $request {
+            fn session_id(&self) -> SessionId {
+                self.session_id
+            }
+        })*
+    };
+}
+
+impl_assets_request!(
+    AssetsPlanRequest,
+    AssetsStageRequest,
+    AssetsApplyRequest,
+    AssetsAckRequest,
+    AssetsWriteRequest,
+    AssetsReadRequest,
+    AssetsSessionRequest,
+    AssetsKnownRequest,
+    AssetsGroupsRequest
+);
+
+fn parse_hash(bytes: &[u8]) -> anyhow::Result<Hash> {
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Hashes must be 32 bytes long, got {}", bytes.len()))
+}
+
+fn handle_assets_plan(
+    session: &ServeSession,
+    request: AssetsPlanRequest,
+) -> anyhow::Result<AssetsPlanResponse> {
+    let assets = request
+        .assets
+        .into_iter()
+        .map(|asset| Ok((asset.path, parse_hash(&asset.hash)?)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let plan = session.asset_store().plan(
+        &request.client_id,
+        &request.place_id,
+        request.session.as_deref(),
+        request.container,
+        &assets,
+        &request.skipped,
+    )?;
+
+    Ok(AssetsPlanResponse {
+        session_id: session.session_id(),
+        first_sync: plan.first_sync,
+        need_upload: plan.need_upload,
+        actions: plan
+            .actions
+            .into_iter()
+            .map(|entry| AssetPlanEntry {
+                path: entry.path,
+                action: entry.action,
+                reason: entry.reason,
+            })
+            .collect(),
+    })
+}
+
+fn handle_assets_stage(
+    session: &ServeSession,
+    request: AssetsStageRequest,
+) -> anyhow::Result<AssetsOkResponse> {
+    let assets = request
+        .assets
+        .into_iter()
+        .map(|asset| (asset.path, asset.data))
+        .collect();
+
+    session
+        .asset_store()
+        .stage(&request.client_id, request.container, assets)?;
+
+    Ok(AssetsOkResponse {
+        session_id: session.session_id(),
+    })
+}
+
+fn handle_assets_apply(
+    session: &ServeSession,
+    request: AssetsApplyRequest,
+) -> anyhow::Result<AssetsOkResponse> {
+    session.asset_store().apply(
+        &request.client_id,
+        &request.place_id,
+        request.container,
+        &request.to_fs,
+        &request.delete_fs,
+    )?;
+
+    Ok(AssetsOkResponse {
+        session_id: session.session_id(),
+    })
+}
+
+fn handle_assets_ack(
+    session: &ServeSession,
+    request: AssetsAckRequest,
+) -> anyhow::Result<AssetsOkResponse> {
+    let applied = request
+        .applied
+        .into_iter()
+        .map(|ack| {
+            Ok(AckEntry {
+                path: ack.path,
+                fs_hash: parse_hash(&ack.fs_hash)?,
+                studio_hash: parse_hash(&ack.studio_hash)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    session.asset_store().ack(
+        &request.place_id,
+        request.container,
+        &applied,
+        &request.removed,
+    )?;
+
+    Ok(AssetsOkResponse {
+        session_id: session.session_id(),
+    })
+}
+
+fn handle_assets_write(
+    session: &ServeSession,
+    request: AssetsWriteRequest,
+) -> anyhow::Result<AssetsWriteResponse> {
+    let mut failures = Vec::new();
+    let mut ops = Vec::with_capacity(request.ops.len());
+
+    for op in request.ops {
+        match (op.kind.as_str(), op.data, op.to) {
+            ("write", Some(data), _) => ops.push(WriteOp::Write {
+                path: op.path,
+                data,
+            }),
+            ("remove", _, _) => ops.push(WriteOp::Remove { path: op.path }),
+            ("move", _, Some(to)) => ops.push(WriteOp::Move { from: op.path, to }),
+            (kind, _, _) => failures.push(AssetWriteFailure {
+                error: format!("malformed {kind} operation"),
+                path: op.path,
+            }),
+        }
+    }
+
+    let store_failures = session.asset_store().write(
+        &request.client_id,
+        &request.place_id,
+        request.container,
+        ops,
+    )?;
+
+    failures.extend(
+        store_failures
+            .into_iter()
+            .map(|(path, error)| AssetWriteFailure { path, error }),
+    );
+
+    for failure in &failures {
+        log::warn!("Could not sync asset {}: {}", failure.path, failure.error);
+    }
+
+    Ok(AssetsWriteResponse {
+        session_id: session.session_id(),
+        failures,
+    })
+}
+
+fn handle_assets_session(
+    session: &ServeSession,
+    request: AssetsSessionRequest,
+) -> anyhow::Result<AssetsOkResponse> {
+    session
+        .asset_store()
+        .start_session(&request.place_id, &request.session)?;
+
+    Ok(AssetsOkResponse {
+        session_id: session.session_id(),
+    })
+}
+
+fn handle_assets_read(
+    session: &ServeSession,
+    request: AssetsReadRequest,
+) -> anyhow::Result<AssetsReadResponse> {
+    let files = session
+        .asset_store()
+        .read(request.container, &request.paths)?
+        .into_iter()
+        .map(|entry| AssetFile {
+            path: entry.path,
+            data: entry.data,
+            hash: entry.hash.to_vec(),
+        })
+        .collect();
+
+    Ok(AssetsReadResponse {
+        session_id: session.session_id(),
+        files,
+    })
+}
+
+fn handle_assets_known(
+    session: &ServeSession,
+    request: AssetsKnownRequest,
+) -> anyhow::Result<AssetsKnownResponse> {
+    let known = session
+        .asset_store()
+        .known(&request.place_id, request.container)?;
+
+    let synced = known
+        .synced
+        .into_iter()
+        .map(|asset| {
+            let latest = std::iter::once(asset.studio[..16].to_vec());
+            let older = asset.older.iter().rev().map(|hash| hash.to_vec());
+
+            AssetSynced {
+                path: asset.path,
+                hashes: latest
+                    .chain(older)
+                    .map(serde_bytes::ByteBuf::from)
+                    .collect(),
+            }
+        })
+        .collect();
+
+    let groups = known
+        .groups
+        .into_iter()
+        .map(|group| AssetGroup {
+            hash: serde_bytes::ByteBuf::from(group.hash.to_vec()),
+            units: group
+                .units
+                .iter()
+                .map(|hash| serde_bytes::ByteBuf::from(hash.to_vec()))
+                .collect(),
+        })
+        .collect();
+
+    Ok(AssetsKnownResponse {
+        session_id: session.session_id(),
+        synced,
+        files: known.files,
+        groups,
+    })
+}
+
+fn handle_assets_groups(
+    session: &ServeSession,
+    request: AssetsGroupsRequest,
+) -> anyhow::Result<AssetsOkResponse> {
+    let groups = request
+        .groups
+        .into_iter()
+        .map(|group| {
+            Ok(Group {
+                hash: parse_hash(&group.hash)?,
+                units: group
+                    .units
+                    .iter()
+                    .map(|hash| parse_hash(hash))
+                    .collect::<anyhow::Result<_>>()?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    session
+        .asset_store()
+        .set_groups(&request.place_id, request.container, groups)?;
+
+    Ok(AssetsOkResponse {
+        session_id: session.session_id(),
+    })
+}
+
+/// Streams asset file changes over a websocket, much like
+/// `handle_websocket_subscription` does for instance changes.
+async fn handle_assets_websocket(
+    serve_session: Arc<ServeSession>,
+    websocket: HyperWebsocket,
+    input_cursor: u32,
+) -> anyhow::Result<()> {
+    let mut websocket = websocket.await?;
+    let session_id = serve_session.session_id();
+    let mut cursor = input_cursor;
+
+    loop {
+        let receiver = serve_session.asset_store().messages().subscribe(cursor);
+
+        tokio::select! {
+            result = receiver => {
+                let Ok((new_cursor, messages)) = result else {
+                    let _ = websocket.send(Message::Close(None)).await;
+                    break;
+                };
+
+                let mut changes = Vec::new();
+                let mut containers_changed = false;
+
+                for message in messages {
+                    match message {
+                        AssetMessage::Change(change) => changes.push(AssetFileChange {
+                            container: change.container,
+                            path: change.path,
+                            removed: change.removed,
+                            origin: change.origin,
+                        }),
+                        AssetMessage::ContainersChanged => containers_changed = true,
+                    }
+                }
+
+                let packet = serialize_msgpack(AssetsSocketPacket {
+                    session_id,
+                    message_cursor: new_cursor,
+                    changes,
+                    containers_changed,
+                })?;
+
+                if websocket.send(Message::Binary(packet)).await.is_err() {
+                    break;
+                }
+                cursor = new_cursor;
+            }
+
+            message = websocket.next() => {
+                match message {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(err)) => {
+                        log::debug!("Assets websocket error: {}", err);
+                        break;
+                    }
+                    Some(Ok(_)) => {}
                 }
             }
         }

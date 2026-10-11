@@ -11,6 +11,7 @@ local t = require(Packages.t)
 local Promise = require(Packages.Promise)
 local Timer = require(script.Parent.Timer)
 
+local AssetSync = require(script.Parent.AssetSync)
 local ChangeBatcher = require(script.Parent.ChangeBatcher)
 local encodePatchUpdate = require(script.Parent.ChangeBatcher.encodePatchUpdate)
 local InstanceMap = require(script.Parent.InstanceMap)
@@ -143,6 +144,23 @@ function ServeSession:setUpdateLoadingTextCallback(callback)
 	self.__updateLoadingText = callback
 end
 
+--[[
+	Sets the function that asks the user what to do when assets changed both in
+	Studio and on disk since they were last synced. It's called with a summary
+	of the changes, yields until the user decides, and returns "KeepStudio",
+	"KeepFiles", or "Abort".
+]]
+function ServeSession:setAssetConfirmCallback(callback)
+	self.__assetConfirmCallback = callback
+end
+
+--[[
+	Sets the function used to show short messages about asset sync.
+]]
+function ServeSession:setAssetNotifyCallback(callback)
+	self.__assetNotifyCallback = callback
+end
+
 function ServeSession:setLoadingText(text: string)
 	self.__updateLoadingText(text)
 end
@@ -197,26 +215,30 @@ function ServeSession:start()
 		:connect()
 		:andThen(function(serverInfo)
 			self:setLoadingText("Loading initial data from server...")
-			return self:__initialSync(serverInfo):andThen(function()
-				self:setLoadingText("Starting sync loop...")
-				self:__setStatus(Status.Connected, serverInfo.projectName)
-				self:__applyGameAndPlaceId(serverInfo)
+			return self:__initialSync(serverInfo)
+				:andThen(function()
+					return self:__startAssetSync()
+				end)
+				:andThen(function()
+					self:setLoadingText("Starting sync loop...")
+					self:__setStatus(Status.Connected, serverInfo.projectName)
+					self:__applyGameAndPlaceId(serverInfo)
 
-				return self.__apiContext:connectWebSocket({
-					["messages"] = function(messagesPacket)
-						if self.__status == Status.Disconnected then
-							return
-						end
+					return self.__apiContext:connectWebSocket({
+						["messages"] = function(messagesPacket)
+							if self.__status == Status.Disconnected then
+								return
+							end
 
-						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
+							Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
 
-						for _, message in messagesPacket.messages do
-							self:__applyPatch(message)
-						end
-						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
-					end,
-				})
-			end)
+							for _, message in messagesPacket.messages do
+								self:__applyPatch(message)
+							end
+							self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+						end,
+					})
+				end)
 		end)
 		:catch(function(err)
 			if self.__status ~= Status.Disconnected then
@@ -568,8 +590,51 @@ function ServeSession:__initialSync(serverInfo)
 	end)
 end
 
+--[[
+	Starts syncing the project's asset directories, if it has any. Needs the
+	instance map to be hydrated, since assets are synced into instances that
+	the project describes.
+]]
+function ServeSession:__startAssetSync()
+	if not Settings:get("syncAssets") then
+		Log.debug("Not syncing assets because the setting is disabled")
+		return Promise.resolve()
+	end
+
+	if RunService:IsRunning() then
+		-- Changes made while playtesting must never end up in files.
+		return Promise.resolve()
+	end
+
+	self:setLoadingText("Syncing assets...")
+
+	self.__assetSync = AssetSync.new({
+		apiContext = self.__apiContext,
+		instanceMap = self.__instanceMap,
+		confirm = function(summary)
+			if self.__assetConfirmCallback == nil then
+				return "Abort"
+			end
+			return self.__assetConfirmCallback(summary)
+		end,
+		notify = function(text)
+			if self.__assetNotifyCallback ~= nil then
+				self.__assetNotifyCallback(text)
+			end
+		end,
+	})
+
+	return self.__assetSync:start()
+end
+
 function ServeSession:__stopInternal(err)
 	self:__setStatus(Status.Disconnected, err)
+
+	if self.__assetSync ~= nil then
+		self.__assetSync:stop()
+		self.__assetSync = nil
+	end
+
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()

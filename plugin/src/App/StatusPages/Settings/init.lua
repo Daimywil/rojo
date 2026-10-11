@@ -240,6 +240,16 @@ function SettingsPage:render()
 				layoutOrder = layoutIncrement(),
 			}),
 
+			SyncAssets = e(Setting, {
+				id = "syncAssets",
+				name = "Sync Assets",
+				description = "Two-way sync the asset directories that the project declares with $assets",
+				locked = self.props.syncActive,
+				lockedTooltip = "(Cannot change while currently syncing. Disconnect first.)",
+				transparency = self.props.transparency,
+				layoutOrder = layoutIncrement(),
+			}),
+
 			LogLevel = e(Setting, {
 				id = "logLevel",
 				name = "Log Level",
