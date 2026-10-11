@@ -7,6 +7,9 @@
 	them one at a time is slow instead, since every call takes at least a frame.
 	How many run at once adapts to how long frames take: it goes up while frames
 	stay short and halves as soon as one takes noticeably longer than usual.
+
+	The functions that serialize or deserialize take an optional `onProgress`,
+	which is called with how many are done after every frame.
 ]]
 
 local EncodingService = game:GetService("EncodingService")
@@ -52,9 +55,10 @@ local function measureUsualFrameTime(): number
 end
 
 --[[
-	Calls `job` with every index from 1 to `count`, spread over frames.
+	Calls `job` with every index from 1 to `count`, spread over frames. Calls
+	`onProgress`, if given, with how many jobs finished after every frame.
 ]]
-local function spread(count: number, job: (number) -> ())
+local function spread(count: number, job: (number) -> (), onProgress: ((number) -> ())?)
 	if count == 0 then
 		return
 	end
@@ -90,6 +94,10 @@ local function spread(count: number, job: (number) -> ())
 		elseif inFlight >= concurrency then
 			concurrency = math.min(MAX_CONCURRENCY, concurrency + 2)
 		end
+
+		if onProgress ~= nil then
+			onProgress(finished)
+		end
 	end
 end
 
@@ -113,11 +121,11 @@ end
 	Serializes each instance on its own. Results are returned in the same
 	order as the given instances.
 ]]
-local function serializeMany(instances: { Instance }, keepData: boolean): { Result }
+local function serializeMany(instances: { Instance }, keepData: boolean, onProgress: ((number) -> ())?): { Result }
 	local results = table.create(#instances)
 	spread(#instances, function(index)
 		results[index] = serializeGroup({ instances[index] }, keepData)
-	end)
+	end, onProgress)
 	return results
 end
 
@@ -125,11 +133,11 @@ end
 	Serializes each group of instances together, which is much faster than
 	serializing them one by one. Only the hashes are kept.
 ]]
-local function serializeGroups(groups: { { Instance } }): { Result }
+local function serializeGroups(groups: { { Instance } }, onProgress: ((number) -> ())?): { Result }
 	local results = table.create(#groups)
 	spread(#groups, function(index)
 		results[index] = serializeGroup(groups[index], false)
-	end)
+	end, onProgress)
 	return results
 end
 
@@ -137,13 +145,13 @@ end
 	Deserializes many models. Results are returned in the same order as the
 	given buffers.
 ]]
-local function deserializeMany(buffers: { buffer }): { DeserializeResult }
+local function deserializeMany(buffers: { buffer }, onProgress: ((number) -> ())?): { DeserializeResult }
 	local results = table.create(#buffers)
 	spread(#buffers, function(index)
 		local success, instances =
 			pcall(SerializationService.DeserializeInstancesAsync, SerializationService, buffers[index])
 		results[index] = if success then { instances = instances } else { err = tostring(instances) }
-	end)
+	end, onProgress)
 	return results
 end
 

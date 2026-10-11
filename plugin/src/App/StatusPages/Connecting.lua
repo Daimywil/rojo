@@ -35,6 +35,7 @@ function ConnectingPage:render()
 					FontFace = theme.Font.Thin,
 					TextSize = theme.TextSize.Medium,
 					TextColor3 = theme.SubTextColor,
+					TextWrapped = true,
 					TextTruncate = Enum.TextTruncate.AtEnd,
 					TextTransparency = self.props.transparency,
 					BackgroundTransparency = 1,

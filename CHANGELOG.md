@@ -36,6 +36,7 @@ Making a new release? Simply add the new header with the version and date undern
 * Other tools, such as Studio's MCP, can ask the plugin to connect by setting the `RojoConnectRequest` attribute of `CoreGui` to `true` or a port. The plugin says what came of it in the `RojoConnectResult` attribute. These connections skip the sync confirmation, but asset conflicts still wait for the user.
 * The port a place last connected to is now saved in the place, and filled in when it is opened again.
 * Fixed HTTP errors whose text contains `%`, like GitHub's error pages, raising an unrelated error that hid them.
+* The sync confirmation now gives way to the loading page as soon as it's answered, instead of staying up until connecting finishes. Syncing assets into a place that doesn't have them yet can take a while, and the loading page shows how far along it is.
 
 [#1333]: https://github.com/rojo-rbx/rojo/pull/1333
 

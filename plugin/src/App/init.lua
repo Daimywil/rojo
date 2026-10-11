@@ -50,6 +50,20 @@ local AppStatus = strict("AppStatus", {
 
 local e = Roact.createElement
 
+-- How long an asset sync prompt is shown before clicks on it count, in seconds
+local ASSET_PROMPT_MIN_SHOWN = 0.5
+-- How long connecting may still take after a prompt shown in a popup is answered before the panel is opened to show
+-- how it's going, in seconds
+local PROGRESS_PANEL_DELAY = 1
+
+local function escapeRichText(text: string): string
+	return (string.gsub(text, "[&<>]", {
+		["&"] = "&amp;",
+		["<"] = "&lt;",
+		[">"] = "&gt;",
+	}))
+end
+
 local App = Roact.Component:extend("App")
 
 function App:init()
@@ -62,6 +76,7 @@ function App:init()
 	self.confirmationBindable = Instance.new("BindableEvent")
 	self.confirmationEvent = self.confirmationBindable.Event
 	self.assetDecisionBindable = Instance.new("BindableEvent")
+	self.assetPromptShownAt = 0
 	self.knownProjects = {}
 	self.notifId = 0
 
@@ -722,7 +737,8 @@ function App:startSession(skipConfirmation: boolean?)
 
 	serveSession:setUpdateLoadingTextCallback(function(text: string)
 		self:setState({
-			connectingText = text,
+			-- The loading page shows rich text, but this is plain text that can contain asset paths
+			connectingText = escapeRichText(text),
 		})
 	end)
 
@@ -917,14 +933,41 @@ function App:startSession(skipConfirmation: boolean?)
 			timeout = 7,
 		})
 
-		return self.confirmationEvent:Wait()
+		local decision = self.confirmationEvent:Wait()
+
+		-- Connecting can take a while after this, like when assets are synced into a place that doesn't have them
+		-- yet, so the prompt is replaced with the loading page right away rather than staying up until it's done
+		if decision ~= "Abort" then
+			self:setState({
+				appStatus = AppStatus.Connecting,
+				-- What was shown before the prompt doesn't apply anymore, and the session says what it does next
+				connectingText = "",
+			})
+
+			-- With the panel closed, the prompt was a popup, which closes now. The loading page is in the panel, so
+			-- that's opened if connecting doesn't finish right away.
+			if not self.state.guiEnabled then
+				task.delay(PROGRESS_PANEL_DELAY, function()
+					if self.serveSession == serveSession and self.state.appStatus == AppStatus.Connecting then
+						self:setState({
+							guiEnabled = true,
+						})
+					end
+				end)
+			end
+		end
+
+		return decision
 	end)
 
 	serveSession:setAssetConfirmCallback(function(summary)
+		self.assetPromptShownAt = os.clock()
 		self:setState({
 			appStatus = AppStatus.AssetConflicts,
 			assetSummary = summary,
 			toolbarIcon = Assets.Images.PluginButton,
+			-- Connecting waits for an answer, which can only be given in the panel
+			guiEnabled = true,
 		})
 
 		self:addNotification({
@@ -1071,6 +1114,15 @@ function App:render()
 						summary = self.state.assetSummary,
 
 						onDecision = function(decision)
+							-- One prompt can follow another right away, one for each asset directory, so clicks meant
+							-- for the last one could answer the next one before it could be read
+							if
+								self.state.appStatus ~= AppStatus.AssetConflicts
+								or os.clock() - self.assetPromptShownAt < ASSET_PROMPT_MIN_SHOWN
+							then
+								return
+							end
+
 							self.assetDecisionBindable:Fire(decision)
 						end,
 					}),

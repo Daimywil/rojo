@@ -53,6 +53,9 @@ local READ_BATCH_SIZE = 200
 local RETRY_DELAY = 3
 -- How long work spread over frames may run before Studio gets to draw one.
 local FRAME_WORK_BUDGET = 0.008
+-- How often the count of a step of the initial sync is updated at most, since
+-- showing it re-renders the plugin's UI.
+local PROGRESS_INTERVAL = 0.2
 -- Unpublished places all have the place ID 0, so they're told apart by a key
 -- stored in the place.
 local LOCAL_PLACE_ATTRIBUTE = "__RojoAssetSyncPlace"
@@ -136,6 +139,9 @@ export type Summary = {
 	  on start. Yields until they do, and returns "KeepStudio", "KeepFiles",
 	  or "Abort".
 	- notify: called with short messages worth showing to the user.
+- progress: called with what the initial sync is doing, as plain text, to
+  show while the session starts. It can take minutes when a place doesn't
+  have the assets yet.
 ]]
 function AssetSync.new(options)
 	local self = {
@@ -143,6 +149,9 @@ function AssetSync.new(options)
 		__instanceMap = options.instanceMap,
 		__confirm = options.confirm,
 		__notify = options.notify or function() end,
+		__onProgress = options.progress or function() end,
+		__showingProgress = false,
+		__progressShownAt = -math.huge,
 
 		-- Identifies our requests, so we can ignore changes we caused.
 		__clientId = HttpService:GenerateGUID(false),
@@ -193,6 +202,7 @@ end
 
 function AssetSync:stop()
 	self.__running = false
+	self.__showingProgress = false
 
 	for _, connection in self.__connections do
 		connection:Disconnect()
@@ -306,9 +316,11 @@ function AssetSync:__start()
 		self.__containerByInstance[instance] = container
 	end
 
+	self.__showingProgress = true
 	for _, container in self.__containers do
 		self:__initialSync(container)
 	end
+	self.__showingProgress = false
 
 	-- Studio now has everything this session knows about. If the place isn't
 	-- saved after this, it won't have this token next time, which tells the
@@ -339,6 +351,33 @@ function AssetSync:__start()
 	task.spawn(function()
 		self:__workerLoop()
 	end)
+end
+
+--[[
+	Shows what the initial sync of a container is doing, like "Placing assets
+	in Studio", and how far along it is if `done` and `total` are given. Does
+	nothing outside of the initial sync, since nothing shows it then.
+]]
+function AssetSync:__progress(container, text: string, done: number?, total: number?)
+	if not self.__showingProgress then
+		return
+	end
+
+	-- Where a step starts is always shown, the count after that a few times a
+	-- second at most.
+	local now = os.clock()
+	if done ~= nil and done > 0 and now - self.__progressShownAt < PROGRESS_INTERVAL then
+		return
+	end
+	self.__progressShownAt = now
+
+	local header = "Syncing " .. container.path
+	if #self.__containers > 1 then
+		header ..= string.format(" (%d of %d)", table.find(self.__containers, container) or 0, #self.__containers)
+	end
+
+	local step = if done ~= nil then string.format("%s: %d of %d", text, done, total or 0) else text .. "..."
+	self.__onProgress(header .. "\n" .. step)
 end
 
 --[[
@@ -374,6 +413,7 @@ end
 function AssetSync:__upload(container, paths: { string }, serialized: { [string]: serializer.Result })
 	local batch = {}
 	local batchBytes = 0
+	local uploaded = 0
 
 	local function flush()
 		if #batch == 0 then
@@ -387,6 +427,9 @@ function AssetSync:__upload(container, paths: { string }, serialized: { [string]
 				assets = batch,
 			})
 			:expect()
+
+		uploaded += #batch
+		self:__progress(container, "Uploading assets to compare them", uploaded, #paths)
 
 		batch = {}
 		batchBytes = 0
@@ -412,8 +455,12 @@ end
 --[[
 	Serializes the given instances, adding the results to `results`.
 ]]
-local function serializeInto(results: { [Instance]: serializer.Result }, instances: { Instance })
-	local serialized = serializer.serializeMany(instances, true)
+local function serializeInto(
+	results: { [Instance]: serializer.Result },
+	instances: { Instance },
+	onProgress: ((number) -> ())?
+)
+	local serialized = serializer.serializeMany(instances, true, onProgress)
 	for index, instance in instances do
 		results[instance] = serialized[index]
 	end
@@ -438,6 +485,8 @@ type Group = {
 	their own.
 ]]
 function AssetSync:__initialLayout(container): (Layout.Layout, { [Instance]: serializer.Result }, { Group })
+	self:__progress(container, "Checking assets in Studio")
+
 	-- Which instances are units doesn't depend on their file names, so they
 	-- can be serialized before the names are decided.
 	local unitLayout = Layout.compute(container.instance, self.__instanceMap)
@@ -464,13 +513,21 @@ function AssetSync:__initialLayout(container): (Layout.Layout, { [Instance]: ser
 		check()
 		return #instance:GetDescendants() + 1
 	end)
+	-- How many units the groups up to each one have, to count progress in
+	-- assets rather than groups.
+	local unitCount = 0
+	local unitsThrough = table.create(#groupedUnits)
 	for index, units in groupedUnits do
 		groups[index] = { units = units }
+		unitCount += #units
+		unitsThrough[index] = unitCount
 	end
 
 	-- The hashes of groups are needed to remember them for next time even
 	-- if there's nothing to compare them with yet.
-	local groupResults = serializer.serializeGroups(groupedUnits)
+	local groupResults = serializer.serializeGroups(groupedUnits, function(finished)
+		self:__progress(container, "Checking assets in Studio", unitsThrough[finished] or 0, unitCount)
+	end)
 	local results = {}
 	local ungrouped = {}
 
@@ -499,7 +556,9 @@ function AssetSync:__initialLayout(container): (Layout.Layout, { [Instance]: ser
 		#groups,
 		#ungrouped
 	)
-	serializeInto(results, ungrouped)
+	serializeInto(results, ungrouped, function(finished)
+		self:__progress(container, "Checking changed assets in Studio", finished, #ungrouped)
+	end)
 
 	local hashes = {}
 	for instance, result in results do
@@ -606,6 +665,7 @@ function AssetSync:__initialSync(container)
 		return list
 	end
 
+	self:__progress(container, "Comparing with the files")
 	local planRequest = {
 		clientId = self.__clientId,
 		placeId = self.__placeId,
@@ -618,6 +678,7 @@ function AssetSync:__initialSync(container)
 	local plan = self.__apiContext:assetsPlan(planRequest):expect()
 	if #plan.needUpload > 0 then
 		Log.debug("Uploading {} assets to compare them", #plan.needUpload)
+		self:__progress(container, "Uploading assets to compare them")
 
 		-- Serializing these again may find that they changed in the meantime,
 		-- so the plan is made with their latest hashes.
@@ -692,6 +753,7 @@ function AssetSync:__initialSync(container)
 	end
 
 	if #toFs > 0 or #deleteFs > 0 then
+		self:__progress(container, "Writing assets to files")
 		self.__apiContext
 			:assetsApply({
 				clientId = self.__clientId,
@@ -904,6 +966,8 @@ end
 function AssetSync:__applyFileChanges(container, changed: { string }, removed: { string })
 	local files = {}
 	for start = 1, #changed, READ_BATCH_SIZE do
+		self:__progress(container, "Reading files", start - 1, #changed)
+
 		local paths = table.move(changed, start, math.min(start + READ_BATCH_SIZE - 1, #changed), 1, {})
 		local response = self.__apiContext
 			:assetsRead({
@@ -945,7 +1009,9 @@ function AssetSync:__applyFileChanges(container, changed: { string }, removed: {
 	for index, file in files do
 		buffers[index] = file.data
 	end
-	local deserialized = serializer.deserializeMany(buffers)
+	local deserialized = serializer.deserializeMany(buffers, function(finished)
+		self:__progress(container, "Loading assets", finished, #buffers)
+	end)
 
 	-- Adding and removing thousands of instances takes Studio a while, so this
 	-- is spread over frames too. It's still a single step to undo.
@@ -955,8 +1021,9 @@ function AssetSync:__applyFileChanges(container, changed: { string }, removed: {
 	local nextStep = frameBudget(FRAME_WORK_BUDGET)
 
 	local success, err = pcall(function()
-		for _, path in toRemove do
+		for index, path in toRemove do
 			nextStep()
+			self:__progress(container, "Removing assets from Studio", index - 1, #toRemove)
 
 			local entry = container.units[path]
 			if entry ~= nil then
@@ -975,6 +1042,7 @@ function AssetSync:__applyFileChanges(container, changed: { string }, removed: {
 
 		for index, file in files do
 			nextStep()
+			self:__progress(container, "Placing assets in Studio", index - 1, #files)
 
 			local result = deserialized[index]
 			local instances = result.instances
@@ -1047,7 +1115,9 @@ function AssetSync:__applyFileChanges(container, changed: { string }, removed: {
 	for index, entry in applied do
 		instances[index] = entry.instance
 	end
-	local results = serializer.serializeMany(instances, false)
+	local results = serializer.serializeMany(instances, false, function(finished)
+		self:__progress(container, "Checking placed assets", finished, #instances)
+	end)
 
 	local acks = {}
 	for index, entry in applied do

@@ -557,6 +557,7 @@ function ServeSession:__initialSync(serverInfo)
 			end
 			-- The user wants their studio DOM to write back to their Rojo DOM
 			-- so we will reverse the patch and send it back
+			self:setLoadingText("Pushing Studio changes to server...")
 
 			local inversePatch = PatchSet.newEmpty()
 
@@ -582,6 +583,7 @@ function ServeSession:__initialSync(serverInfo)
 
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
+			self:setLoadingText("Applying changes from server...")
 			self:__applyPatch(catchUpPatch)
 			return Promise.resolve()
 		else
@@ -621,6 +623,9 @@ function ServeSession:__startAssetSync()
 			if self.__assetNotifyCallback ~= nil then
 				self.__assetNotifyCallback(text)
 			end
+		end,
+		progress = function(text)
+			self:setLoadingText(text)
 		end,
 	})
 
