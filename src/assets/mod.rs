@@ -11,10 +11,12 @@
 //! The Studio plugin serializes and deserializes assets natively using
 //! `SerializationService`, so the server only stores and compares bytes. It
 //! never decodes assets during sync, which keeps sync lossless even for
-//! properties rbx-dom doesn't know about yet.
+//! properties rbx-dom doesn't know about yet. The only values it looks at are
+//! floats, to tell rounding noise apart from real changes (see `compare`).
 
 mod build;
 mod cache;
+mod compare;
 mod names;
 mod plan;
 mod rbxm;

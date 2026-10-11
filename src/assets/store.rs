@@ -17,6 +17,7 @@ use crate::{message_queue::MessageQueue, snapshot::RojoTree};
 
 use super::{
     cache::{self, FileEntry},
+    compare,
     names::{self, is_under, keys_at_or_under},
     plan::{decide, AssetSides, Decision, PlanAction, PlanReason},
     rbxm::{self, ChunkCompression},
@@ -180,6 +181,18 @@ fn canonical_hash(contents: &[u8]) -> Result<Hash, rbxm::RbxmError> {
     } else {
         Ok(hash_bytes(&rbxm::canonicalize(contents)?))
     }
+}
+
+/// Whether an asset file only differs from Studio's version of it by rounding
+/// in some floats. The file must still have the contents it was indexed with,
+/// so that a file that's being changed on disk isn't mistaken for either.
+fn file_only_differs_by_noise(root: &Path, path: &str, entry: &FileEntry, studio: &[u8]) -> bool {
+    let Ok(contents) = fs::read(absolute_path(root, path)) else {
+        return false;
+    };
+
+    canonical_hash(&contents).is_ok_and(|hash| hash == entry.hash)
+        && compare::same_except_float_noise(&contents, studio)
 }
 
 /// The result of reading an asset file from disk.
@@ -1001,6 +1014,7 @@ impl AssetStore {
             });
 
         let key = inner.containers[index].info.key.clone();
+        let root = inner.containers[index].canonical_root.clone();
         let files = inner.containers[index].files.as_ref().unwrap();
 
         let studio_map: HashMap<&str, Hash> = studio
@@ -1009,6 +1023,34 @@ impl AssetStore {
             .collect();
         let skipped: BTreeSet<&str> = skipped.iter().map(String::as_str).collect();
         let staged = inner.staging.get(&(client.to_owned(), container));
+
+        // Studio's uploaded version of an asset, if it's still the version
+        // Studio has.
+        let uploaded = |path: &str| {
+            staged
+                .and_then(|staged| staged.get(path))
+                .filter(|staged| Some(staged.raw_hash) == studio_map.get(path).copied())
+        };
+
+        // Uploads that differ from their files are compared more closely,
+        // since Studio may only have rounded some floats differently.
+        let differing: Vec<(&str, &StagedAsset, &FileEntry)> = studio_map
+            .keys()
+            .filter_map(|&path| {
+                let staged = uploaded(path)?;
+                let entry = files.get(path)?;
+                (entry.hash != staged.canonical_hash).then_some((path, staged, entry))
+            })
+            .collect();
+        let noise_only: HashSet<&str> = differing
+            .into_par_iter()
+            .filter(|(path, staged, entry)| {
+                root.as_deref()
+                    .is_some_and(|root| file_only_differs_by_noise(root, path, entry, &staged.raw))
+            })
+            .map(|(path, ..)| path)
+            .collect();
+
         let bases = inner
             .state
             .container(place, &key)
@@ -1036,13 +1078,14 @@ impl AssetStore {
                 continue;
             }
 
-            let studio_hash = studio_map.get(path).copied();
             let sides = AssetSides {
-                studio: studio_hash,
-                studio_canonical: staged
-                    .and_then(|staged| staged.get(path))
-                    .filter(|staged| Some(staged.raw_hash) == studio_hash)
-                    .map(|staged| staged.canonical_hash),
+                studio: studio_map.get(path).copied(),
+                studio_matches_file: uploaded(path).map(|staged| {
+                    files
+                        .get(path)
+                        .is_some_and(|entry| entry.hash == staged.canonical_hash)
+                        || noise_only.contains(path)
+                }),
                 fs: files.get(path).map(|entry| entry.hash),
                 base: bases.get(path),
                 place_saved,
@@ -1650,6 +1693,15 @@ fn execute_ops(
                     && fs::metadata(&absolute).is_ok();
 
                 if !unchanged {
+                    // Studio may only have rounded some floats differently,
+                    // which isn't worth a change to the file.
+                    let noise_only = existing.filter(|entry| {
+                        file_only_differs_by_noise(&root, &path, entry, &canonical)
+                    });
+                    if let Some(existing) = noise_only {
+                        return Ok((*existing, hash_bytes(&raw)));
+                    }
+
                     write_atomic(&absolute, &canonical)?;
                 }
 
@@ -1793,6 +1845,113 @@ mod test {
 
         let hashes = fixture.store.file_hashes(fixture.container).unwrap();
         assert_eq!(hashes.get("Maps/Rock.rbxm"), Some(&hash_bytes(&on_disk)));
+    }
+
+    /// The model of [`studio_model`], with its transparency rounded the other
+    /// way, the way Studio sometimes rounds floats when loading and saving.
+    fn rounded_model(name: &str, transparency: f32) -> Vec<u8> {
+        studio_model(name, f32::from_bits(transparency.to_bits() + 1))
+    }
+
+    #[test]
+    fn writes_that_only_round_floats_keep_the_file() {
+        let fixture = fixture();
+        let original = studio_model("Rock", 0.5);
+        let rounded = rounded_model("Rock", 0.5);
+        assert_ne!(
+            rbxm::canonicalize(&original).unwrap(),
+            rbxm::canonicalize(&rounded).unwrap()
+        );
+
+        let path = fixture.assets.join("Rock.rbxm");
+        let write = |model: &Vec<u8>| {
+            let failures = fixture
+                .store
+                .write(
+                    "client",
+                    "1",
+                    fixture.container,
+                    vec![write_op("Rock.rbxm", model.clone())],
+                )
+                .unwrap();
+            assert_eq!(failures, Vec::new());
+        };
+
+        write(&original);
+        let before = fs::read(&path).unwrap();
+        write(&rounded);
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // The rounded version is what the place synced last, so the place is
+        // in sync without uploading anything.
+        let plan = fixture
+            .store
+            .plan(
+                "client",
+                "1",
+                None,
+                fixture.container,
+                &[("Rock.rbxm".to_owned(), hash_bytes(&rounded))],
+                &[],
+            )
+            .unwrap();
+        assert_in_sync(&plan);
+
+        // Real changes are still written.
+        let changed = studio_model("Rock", 0.75);
+        write(&changed);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            rbxm::canonicalize(&changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn plans_treat_rounded_floats_as_in_sync() {
+        let fixture = fixture();
+        fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op("Rock.rbxm", studio_model("Rock", 0.5))],
+            )
+            .unwrap();
+
+        // Places that never synced have nothing to tell which side is right,
+        // so Studio's contents are compared with the file's.
+        let plan_for = |place: &str, model: Vec<u8>| {
+            let studio = [("Rock.rbxm".to_owned(), hash_bytes(&model))];
+            let plan = fixture
+                .store
+                .plan("client", place, None, fixture.container, &studio, &[])
+                .unwrap();
+            assert_eq!(plan.need_upload, vec!["Rock.rbxm".to_owned()]);
+
+            fixture
+                .store
+                .stage(
+                    "client",
+                    fixture.container,
+                    vec![("Rock.rbxm".to_owned(), model)],
+                )
+                .unwrap();
+            fixture
+                .store
+                .plan("client", place, None, fixture.container, &studio, &[])
+                .unwrap()
+        };
+
+        assert_in_sync(&plan_for("2", rounded_model("Rock", 0.5)));
+        assert_eq!(
+            plan_for("3", studio_model("Rock", 0.75)).actions,
+            vec![PlanEntry {
+                path: "Rock.rbxm".to_owned(),
+                action: PlanAction::Conflict,
+                reason: Some(PlanReason::BothChanged),
+            }]
+        );
     }
 
     #[test]

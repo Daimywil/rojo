@@ -53,8 +53,10 @@ pub struct AssetSides<'a> {
     /// Hash of the bytes Studio serialized the asset to, if Studio has it.
     pub studio: Option<Hash>,
 
-    /// Hash of the canonical form of Studio's bytes, if they were uploaded.
-    pub studio_canonical: Option<Hash>,
+    /// Whether Studio's contents match the file, if they were uploaded.
+    /// Contents that only differ from it by rounding in some floats match.
+    /// Without a file, they never do.
+    pub studio_matches_file: Option<bool>,
 
     /// Hash of the asset file, if it exists.
     pub fs: Option<Hash>,
@@ -86,6 +88,9 @@ pub enum Decision {
 ///   the last sync. Studio's version might be older than the file then.
 /// - If both sides changed, their contents are compared. Identical contents
 ///   are in sync, anything else is a conflict.
+/// - Contents that only differ by rounding in some floats count as identical,
+///   since Studio doesn't always load and save floats exactly. Writing that
+///   noise to files or asking about it would only get in the way.
 /// - Assets missing from Studio are restored if the place wasn't saved, and
 ///   are a conflict otherwise, since Studio may have lost them.
 /// - Without a base, both sides are compared directly, and an asset that only
@@ -99,14 +104,14 @@ pub fn decide(sides: AssetSides) -> Decision {
     use PlanAction::*;
     use PlanReason::*;
 
-    let compare = |fs: Hash, reason: PlanReason| match sides.studio_canonical {
-        Some(studio) if studio == fs => Action(InSync, None),
-        Some(_) => Action(Conflict, Some(reason)),
+    let compare = |reason: PlanReason| match sides.studio_matches_file {
+        Some(true) => Action(InSync, None),
+        Some(false) => Action(Conflict, Some(reason)),
         None => NeedsUpload,
     };
 
     let needs_studio_contents =
-        |action: PlanAction, reason: Option<PlanReason>| match sides.studio_canonical {
+        |action: PlanAction, reason: Option<PlanReason>| match sides.studio_matches_file {
             Some(_) => Action(action, reason),
             None => NeedsUpload,
         };
@@ -119,8 +124,8 @@ pub fn decide(sides: AssetSides) -> Decision {
             if studio_changed && base.is_older_studio_version(&studio) {
                 // Studio's contents can still match the file, for example if
                 // the asset was changed and then changed back.
-                return match sides.studio_canonical {
-                    Some(canonical) if canonical == fs => Action(InSync, None),
+                return match sides.studio_matches_file {
+                    Some(true) => Action(InSync, None),
                     _ => Action(ToStudio, Some(OutdatedInStudio)),
                 };
             }
@@ -128,12 +133,18 @@ pub fn decide(sides: AssetSides) -> Decision {
             match (studio_changed, fs_changed) {
                 (false, false) => Action(InSync, None),
                 (false, true) => Action(ToStudio, None),
-                (true, false) if sides.place_saved => needs_studio_contents(ToFs, None),
-                (true, false) => compare(fs, UnsavedPlace),
-                (true, true) => compare(fs, BothChanged),
+                // Studio's version can still match the file, for example if
+                // only some floats were rounded differently.
+                (true, false) if sides.place_saved => match sides.studio_matches_file {
+                    Some(true) => Action(InSync, None),
+                    Some(false) => Action(ToFs, None),
+                    None => NeedsUpload,
+                },
+                (true, false) => compare(UnsavedPlace),
+                (true, true) => compare(BothChanged),
             }
         }
-        (Some(_), Some(fs), None) => compare(fs, BothChanged),
+        (Some(_), Some(_), None) => compare(BothChanged),
 
         (Some(studio), None, Some(base)) => {
             if studio == base.studio || base.is_older_studio_version(&studio) {
@@ -173,6 +184,8 @@ mod test {
         BaseEntry::new(fs, studio)
     }
 
+    /// `studio_canonical` is the hash of Studio's contents if they were
+    /// uploaded, which match the file if it has the same hash.
     fn sides(
         studio: Option<Hash>,
         studio_canonical: Option<Hash>,
@@ -181,7 +194,7 @@ mod test {
     ) -> AssetSides<'_> {
         AssetSides {
             studio,
-            studio_canonical,
+            studio_matches_file: studio_canonical.map(|canonical| Some(canonical) == fs),
             fs,
             base,
             place_saved: true,
@@ -191,6 +204,14 @@ mod test {
     fn unsaved(sides: AssetSides<'_>) -> AssetSides<'_> {
         AssetSides {
             place_saved: false,
+            ..sides
+        }
+    }
+
+    /// Studio's contents differ from the file, but only by rounding in floats.
+    fn noisy(sides: AssetSides<'_>) -> AssetSides<'_> {
+        AssetSides {
+            studio_matches_file: Some(true),
             ..sides
         }
     }
@@ -386,6 +407,45 @@ mod test {
         // Unless Studio's contents match the file anyway.
         assert_eq!(
             decide(unsaved(sides(Some(C), Some(B), Some(B), Some(&base)))),
+            action(PlanAction::InSync)
+        );
+    }
+
+    #[test]
+    fn rounding_noise_is_never_written_or_asked_about() {
+        let base = base(B, A);
+
+        // Only Studio changed, but only by rounding, so there's nothing to
+        // write. That's true whether or not the place was saved.
+        assert_eq!(
+            decide(noisy(sides(Some(C), Some(C), Some(B), Some(&base)))),
+            action(PlanAction::InSync)
+        );
+        assert_eq!(
+            decide(unsaved(noisy(sides(
+                Some(C),
+                Some(C),
+                Some(B),
+                Some(&base)
+            )))),
+            action(PlanAction::InSync)
+        );
+
+        // Both sides changed, or the place never synced before.
+        assert_eq!(
+            decide(noisy(sides(Some(C), Some(C), Some(D), Some(&base)))),
+            action(PlanAction::InSync)
+        );
+        assert_eq!(
+            decide(noisy(sides(Some(C), Some(C), Some(B), None))),
+            action(PlanAction::InSync)
+        );
+
+        // Studio went back to an older version that only differs by rounding.
+        let mut base = base;
+        base.older.push(short_hash(&D));
+        assert_eq!(
+            decide(noisy(sides(Some(D), Some(D), Some(B), Some(&base)))),
             action(PlanAction::InSync)
         );
     }

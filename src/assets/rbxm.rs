@@ -11,7 +11,7 @@
 //! not understand yet, so assets only ever go through these byte-level
 //! transformations to guarantee that what Studio wrote is what Studio reads.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 const FILE_MAGIC: &[u8] = b"<roblox!";
 const FILE_SIGNATURE: &[u8] = b"\x89\xff\x0d\x0a\x1a\x0a";
@@ -267,6 +267,52 @@ pub fn canonicalize(contents: &[u8]) -> Result<Vec<u8>, RbxmError> {
 pub fn is_canonical(contents: &[u8]) -> Result<bool, RbxmError> {
     let chunks = parse(contents)?.chunks;
     Ok(chunks.iter().all(|chunk| !chunk.compressed))
+}
+
+/// A chunk of a binary model, with its contents decompressed.
+pub struct Chunk<'a> {
+    pub name: [u8; 4],
+    pub reserved: [u8; 4],
+    pub data: Cow<'a, [u8]>,
+}
+
+/// A binary model split into its parts.
+pub struct Chunks<'a> {
+    pub header: &'a [u8],
+    pub chunks: Vec<Chunk<'a>>,
+    /// Any bytes that follow the END chunk.
+    pub trailing: &'a [u8],
+}
+
+/// Splits a binary model into its header, its chunks with their contents
+/// decompressed, and any bytes that follow the END chunk.
+pub fn chunks(contents: &[u8]) -> Result<Chunks<'_>, RbxmError> {
+    let ParsedModel {
+        header,
+        chunks,
+        trailing,
+    } = parse(contents)?;
+
+    let chunks = chunks
+        .iter()
+        .map(|chunk| {
+            Ok(Chunk {
+                name: chunk.name,
+                reserved: chunk.reserved,
+                data: if chunk.compressed {
+                    Cow::Owned(chunk.decompress()?)
+                } else {
+                    Cow::Borrowed(chunk.stored)
+                },
+            })
+        })
+        .collect::<Result<_, RbxmError>>()?;
+
+    Ok(Chunks {
+        header,
+        chunks,
+        trailing,
+    })
 }
 
 #[cfg(test)]
