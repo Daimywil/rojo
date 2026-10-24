@@ -54,7 +54,8 @@ pub struct AssetSides<'a> {
     pub studio: Option<Hash>,
 
     /// Whether Studio's contents match the file, if they were uploaded.
-    /// Contents that only differ from it by rounding in some floats match.
+    /// Contents that only differ from it in ways Studio changes on its own,
+    /// like rounding in some floats or the order of siblings, match.
     /// Without a file, they never do.
     pub studio_matches_file: Option<bool>,
 
@@ -88,9 +89,10 @@ pub enum Decision {
 ///   the last sync. Studio's version might be older than the file then.
 /// - If both sides changed, their contents are compared. Identical contents
 ///   are in sync, anything else is a conflict.
-/// - Contents that only differ by rounding in some floats count as identical,
-///   since Studio doesn't always load and save floats exactly. Writing that
-///   noise to files or asking about it would only get in the way.
+/// - Contents that only differ by rounding in some floats, the order of
+///   siblings, or `UniqueId`s count as identical, since Studio changes those
+///   on its own. Writing that noise to files or asking about it would only
+///   get in the way.
 /// - Assets missing from Studio are restored if the place wasn't saved, and
 ///   are a conflict otherwise, since Studio may have lost them.
 /// - Without a base, both sides are compared directly, and an asset that only

@@ -183,16 +183,28 @@ fn canonical_hash(contents: &[u8]) -> Result<Hash, rbxm::RbxmError> {
     }
 }
 
-/// Whether an asset file only differs from Studio's version of it by rounding
-/// in some floats. The file must still have the contents it was indexed with,
+/// Whether an asset file only differs from Studio's version of it in ways
+/// Studio changes on its own, like rounding floats or the order of siblings
+/// (see `compare`). The file must still have the contents it was indexed with,
 /// so that a file that's being changed on disk isn't mistaken for either.
 fn file_only_differs_by_noise(root: &Path, path: &str, entry: &FileEntry, studio: &[u8]) -> bool {
     let Ok(contents) = fs::read(absolute_path(root, path)) else {
         return false;
     };
 
-    canonical_hash(&contents).is_ok_and(|hash| hash == entry.hash)
-        && compare::same_except_float_noise(&contents, studio)
+    if !canonical_hash(&contents).is_ok_and(|hash| hash == entry.hash) {
+        return false;
+    }
+
+    match compare::compare(&contents, studio) {
+        Ok(()) => true,
+        Err(difference) => {
+            // This tells why a file was rewritten when nobody changed the
+            // asset, which is otherwise impossible to see in a binary file.
+            log::debug!("Studio's version of {path} differs from the file: {difference}");
+            false
+        }
+    }
 }
 
 /// The result of reading an asset file from disk.
@@ -1033,7 +1045,8 @@ impl AssetStore {
         };
 
         // Uploads that differ from their files are compared more closely,
-        // since Studio may only have rounded some floats differently.
+        // since Studio may only have rounded some floats differently or put
+        // siblings in another order.
         let differing: Vec<(&str, &StagedAsset, &FileEntry)> = studio_map
             .keys()
             .filter_map(|&path| {
@@ -1693,8 +1706,9 @@ fn execute_ops(
                     && fs::metadata(&absolute).is_ok();
 
                 if !unchanged {
-                    // Studio may only have rounded some floats differently,
-                    // which isn't worth a change to the file.
+                    // Studio may only have rounded some floats differently or
+                    // put siblings in another order, which isn't worth a
+                    // change to the file.
                     let noise_only = existing.filter(|entry| {
                         file_only_differs_by_noise(&root, &path, entry, &canonical)
                     });
@@ -1951,6 +1965,101 @@ mod test {
                 action: PlanAction::Conflict,
                 reason: Some(PlanReason::BothChanged),
             }]
+        );
+    }
+
+    /// A tree whose parts are in the given order.
+    fn tree_model(parts: &[&str]) -> Vec<u8> {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let tree = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("Model").with_name("Tree"),
+        );
+        for name in parts {
+            dom.insert(tree, InstanceBuilder::new("Part").with_name(*name));
+        }
+
+        let mut output = Vec::new();
+        rbx_binary::to_writer(&mut output, &dom, &[tree]).unwrap();
+        output
+    }
+
+    #[test]
+    fn studio_reordering_siblings_does_not_change_the_file() {
+        let fixture = fixture();
+        let path = fixture.assets.join("Tree.rbxm");
+        let original = tree_model(&["Trunk", "Branch", "Leaf"]);
+        let reordered = tree_model(&["Leaf", "Trunk", "Branch"]);
+
+        fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op("Tree.rbxm", original)],
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // The place was saved and opened again, and Studio now has the parts
+        // in another order, which isn't a change worth writing.
+        let studio = [("Tree.rbxm".to_owned(), hash_bytes(&reordered))];
+        let plan = fixture
+            .store
+            .plan("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_eq!(plan.need_upload, vec!["Tree.rbxm".to_owned()]);
+
+        fixture
+            .store
+            .stage(
+                "client",
+                fixture.container,
+                vec![("Tree.rbxm".to_owned(), reordered.clone())],
+            )
+            .unwrap();
+        let plan = fixture
+            .store
+            .plan("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_in_sync(&plan);
+
+        // The new order is remembered, so the next session doesn't have to
+        // upload it again.
+        let plan = fixture
+            .store
+            .plan("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_in_sync(&plan);
+
+        // Writing the reordered version during live sync keeps the file too.
+        let failures = fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op("Tree.rbxm", reordered)],
+            )
+            .unwrap();
+        assert_eq!(failures, Vec::new());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // Real changes are still written.
+        let changed = tree_model(&["Leaf", "Trunk", "Twig"]);
+        fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op("Tree.rbxm", changed.clone())],
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            rbxm::canonicalize(&changed).unwrap()
         );
     }
 
