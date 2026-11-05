@@ -12,13 +12,19 @@
 //! - Every instance has a `UniqueId`, which only identifies it, and which
 //!   Studio gives copies of an instance new values for.
 //!
+//! - New versions of Studio start saving properties that older ones didn't,
+//!   like `InputSinkEnabled` of GUIs. Every asset with that kind of instance
+//!   then saves differently from the file an older Studio saved, though
+//!   loading that file gives the property its default value all the same.
+//!
 //! Treating any of that as an edit would rewrite files and ask the user about
 //! changes nobody made. So models are compared as trees of instances rather
 //! than as bytes: siblings may be in any order, floats may differ by rounding,
-//! and `UniqueId`s may differ. Everything else has to be identical, including
-//! integers, rotation IDs, and the instances that references point to.
-//! Models with anything this doesn't know how to read, like a type of value
-//! that's new to it, are never the same.
+//! and `UniqueId`s may differ. Properties that only one of them has can be
+//! left out too (see [`Properties`]). Everything else has to be identical,
+//! including integers, rotation IDs, and the instances that references point
+//! to. Models with anything this doesn't know how to read, like a type of
+//! value that's new to it, are never the same.
 
 use std::{
     borrow::Cow,
@@ -91,16 +97,42 @@ impl fmt::Display for Difference {
     }
 }
 
+/// Which properties two models are compared on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Properties {
+    /// Every property. One that only one of them has is a difference.
+    All,
+
+    /// Only the properties both have. A property only Studio has is one that
+    /// the Studio that saved the file didn't save yet, and one only the file
+    /// has is one that Studio stopped saving or doesn't know yet. Neither is
+    /// an edit, with one exception this can't tell apart: a property only
+    /// Studio has that was set to something other than its default.
+    Shared,
+}
+
 /// Checks whether an asset file and Studio's version of it hold the same
 /// instances, apart from the differences Studio makes on its own (see the
 /// module's documentation).
-pub fn compare(file: &[u8], studio: &[u8]) -> Result<(), Difference> {
+pub fn compare(file: &[u8], studio: &[u8], properties: Properties) -> Result<(), Difference> {
     let file = uncompressed(file).map_err(|err| Difference(format!("the file {err}")))?;
     let studio =
         uncompressed(studio).map_err(|err| Difference(format!("Studio's version {err}")))?;
-    let file = Model::parse(&file).map_err(|err| Difference(format!("the file {err}")))?;
-    let studio =
+    let mut file = Model::parse(&file).map_err(|err| Difference(format!("the file {err}")))?;
+    let mut studio =
         Model::parse(&studio).map_err(|err| Difference(format!("Studio's version {err}")))?;
+
+    if properties == Properties::Shared {
+        keep_shared_properties(&mut file, &mut studio);
+    }
+
+    // Fingerprints cover every property, so they can only be taken once it's
+    // settled which properties are compared.
+    file.fingerprint_all()
+        .map_err(|err| Difference(format!("the file {err}")))?;
+    studio
+        .fingerprint_all()
+        .map_err(|err| Difference(format!("Studio's version {err}")))?;
 
     if file.header != studio.header {
         return Err(Difference(
@@ -124,6 +156,40 @@ pub fn compare(file: &[u8], studio: &[u8]) -> Result<(), Difference> {
     } else {
         explain(&file, &studio)
     }))
+}
+
+/// Leaves out every property that the same class doesn't have in the other
+/// model, so that only the properties both have are compared.
+fn keep_shared_properties(a: &mut Model<'_>, b: &mut Model<'_>) {
+    type PropertiesByClass = HashMap<Vec<u8>, HashSet<Vec<u8>>>;
+
+    fn properties_by_class(model: &Model<'_>) -> PropertiesByClass {
+        model
+            .classes
+            .iter()
+            .map(|class| {
+                let names = class
+                    .columns
+                    .iter()
+                    .map(|column| column.name.to_vec())
+                    .collect();
+                (class.name.to_vec(), names)
+            })
+            .collect()
+    }
+
+    fn retain(model: &mut Model<'_>, other: &PropertiesByClass) {
+        for class in &mut model.classes {
+            // A class only one of them has makes them different either way.
+            if let Some(names) = other.get(class.name) {
+                class.columns.retain(|column| names.contains(column.name));
+            }
+        }
+    }
+
+    let (in_a, in_b) = (properties_by_class(a), properties_by_class(b));
+    retain(a, &in_b);
+    retain(b, &in_a);
 }
 
 /// The model with none of its chunks compressed, which is how asset files are
@@ -415,7 +481,6 @@ impl<'a> Model<'a> {
             }
         }
 
-        model.fingerprint_all()?;
         Ok(model)
     }
 
@@ -1379,7 +1444,7 @@ mod test {
     }
 
     fn same(a: &[u8], b: &[u8]) -> bool {
-        compare(a, b).is_ok()
+        compare(a, b, Properties::All).is_ok()
     }
 
     fn serialize(dom: &WeakDom, root: Ref) -> Vec<u8> {
@@ -1769,35 +1834,92 @@ mod test {
 
     #[test]
     fn differences_say_where_they_are() {
+        let explain = |a: &[u8], b: &[u8]| compare(a, b, Properties::All).unwrap_err().to_string();
+
         let a = model(vec![("Transparency", 0.25f32.into())]);
         let b = model(vec![("Transparency", 0.5f32.into())]);
-        assert_eq!(
-            compare(&a, &b).unwrap_err().to_string(),
-            "Arm.Palm.Transparency differs"
-        );
+        assert_eq!(explain(&a, &b), "Arm.Palm.Transparency differs");
 
         let reordered = parts(&[("Trunk", 0.0), ("Branch", 1.0)]);
         let moved = parts(&[("Branch", 1.5), ("Trunk", 0.0)]);
-        assert_eq!(
-            compare(&reordered, &moved).unwrap_err().to_string(),
-            "Tree.Branch.CFrame differs"
-        );
+        assert_eq!(explain(&reordered, &moved), "Tree.Branch.CFrame differs");
 
         let fewer = parts(&[("Trunk", 0.0)]);
         assert_eq!(
-            compare(&reordered, &fewer).unwrap_err().to_string(),
+            explain(&reordered, &fewer),
             "they have a different number of instances or classes"
         );
 
         let renamed = parts(&[("Trunk", 0.0), ("Twig", 1.0)]);
         assert_eq!(
-            compare(&reordered, &renamed).unwrap_err().to_string(),
+            explain(&reordered, &renamed),
             "Tree.Branch is only in the file"
         );
 
-        assert!(compare(&a, b"not a model")
-            .unwrap_err()
-            .to_string()
-            .starts_with("Studio's version can't be read"));
+        assert!(explain(&a, b"not a model").starts_with("Studio's version can't be read"));
+    }
+
+    #[test]
+    fn properties_only_one_side_has_can_be_left_out() {
+        // A newer version of Studio saves a property the file doesn't have.
+        let old = model(vec![("Transparency", 0.25f32.into())]);
+        let new = model(vec![
+            ("Transparency", 0.25f32.into()),
+            ("PropertyFromNewerStudio", false.into()),
+        ]);
+
+        assert_eq!(
+            compare(&old, &new, Properties::All)
+                .unwrap_err()
+                .to_string(),
+            "Arm.Palm.PropertyFromNewerStudio is only in Studio"
+        );
+        assert!(compare(&old, &new, Properties::Shared).is_ok());
+        // A property only the file has, like one Studio stopped saving.
+        assert!(compare(&new, &old, Properties::Shared).is_ok());
+
+        // The properties both have still have to be the same.
+        let changed = model(vec![
+            ("Transparency", 0.5f32.into()),
+            ("PropertyFromNewerStudio", false.into()),
+        ]);
+        assert_eq!(
+            compare(&old, &changed, Properties::Shared)
+                .unwrap_err()
+                .to_string(),
+            "Arm.Palm.Transparency differs"
+        );
+    }
+
+    #[test]
+    fn leaving_out_properties_keeps_the_rest_of_the_comparison() {
+        // Siblings that look alike are only told apart by properties both
+        // have, and references still have to point to the same instance.
+        let welds = |order: [&str; 3], part1: &str, new_property: bool| {
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let model = dom.insert(dom.root_ref(), InstanceBuilder::new("Model"));
+            let mut refs = HashMap::new();
+            for name in order {
+                let mut part = InstanceBuilder::new("Part").with_name(name);
+                if new_property {
+                    part = part.with_property("PropertyFromNewerStudio", true);
+                }
+                refs.insert(name, dom.insert(model, part));
+            }
+            dom.insert(
+                model,
+                InstanceBuilder::new("WeldConstraint")
+                    .with_property("Part0", refs["Handle"])
+                    .with_property("Part1", refs[part1]),
+            );
+            serialize(&dom, model)
+        };
+
+        let file = welds(["Handle", "Blade", "Guard"], "Blade", false);
+        let studio = welds(["Guard", "Blade", "Handle"], "Blade", true);
+        assert!(compare(&file, &studio, Properties::Shared).is_ok());
+
+        let rewelded = welds(["Guard", "Blade", "Handle"], "Guard", true);
+        assert!(compare(&file, &rewelded, Properties::Shared).is_err());
     }
 }

@@ -17,7 +17,7 @@ use crate::{message_queue::MessageQueue, snapshot::RojoTree};
 
 use super::{
     cache::{self, FileEntry},
-    compare,
+    compare::{self, Properties},
     names::{self, is_under, keys_at_or_under},
     plan::{decide, AssetSides, Decision, PlanAction, PlanReason},
     rbxm::{self, ChunkCompression},
@@ -187,7 +187,13 @@ fn canonical_hash(contents: &[u8]) -> Result<Hash, rbxm::RbxmError> {
 /// Studio changes on its own, like rounding floats or the order of siblings
 /// (see `compare`). The file must still have the contents it was indexed with,
 /// so that a file that's being changed on disk isn't mistaken for either.
-fn file_only_differs_by_noise(root: &Path, path: &str, entry: &FileEntry, studio: &[u8]) -> bool {
+fn file_only_differs_by_noise(
+    root: &Path,
+    path: &str,
+    entry: &FileEntry,
+    studio: &[u8],
+    properties: Properties,
+) -> bool {
     let Ok(contents) = fs::read(absolute_path(root, path)) else {
         return false;
     };
@@ -196,7 +202,7 @@ fn file_only_differs_by_noise(root: &Path, path: &str, entry: &FileEntry, studio
         return false;
     }
 
-    match compare::compare(&contents, studio) {
+    match compare::compare(&contents, studio, properties) {
         Ok(()) => true,
         Err(difference) => {
             // This tells why a file was rewritten when nobody changed the
@@ -1047,6 +1053,12 @@ impl AssetStore {
         // Uploads that differ from their files are compared more closely,
         // since Studio may only have rounded some floats differently or put
         // siblings in another order.
+        //
+        // Properties only one side has are left out too. A new version of
+        // Studio saves properties older ones didn't, which changes every asset
+        // with that kind of instance at once, and this is the first time that
+        // shows. Live writes compare every property, since Studio only sends
+        // those once something changed, which might be one of these properties.
         let differing: Vec<(&str, &StagedAsset, &FileEntry)> = studio_map
             .keys()
             .filter_map(|&path| {
@@ -1058,8 +1070,9 @@ impl AssetStore {
         let noise_only: HashSet<&str> = differing
             .into_par_iter()
             .filter(|(path, staged, entry)| {
-                root.as_deref()
-                    .is_some_and(|root| file_only_differs_by_noise(root, path, entry, &staged.raw))
+                root.as_deref().is_some_and(|root| {
+                    file_only_differs_by_noise(root, path, entry, &staged.raw, Properties::Shared)
+                })
             })
             .map(|(path, ..)| path)
             .collect();
@@ -1710,7 +1723,7 @@ fn execute_ops(
                     // put siblings in another order, which isn't worth a
                     // change to the file.
                     let noise_only = existing.filter(|entry| {
-                        file_only_differs_by_noise(&root, &path, entry, &canonical)
+                        file_only_differs_by_noise(&root, &path, entry, &canonical, Properties::All)
                     });
                     if let Some(existing) = noise_only {
                         return Ok((*existing, hash_bytes(&raw)));
@@ -2057,6 +2070,104 @@ mod test {
                 vec![write_op("Tree.rbxm", changed.clone())],
             )
             .unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            rbxm::canonicalize(&changed).unwrap()
+        );
+    }
+
+    /// The model of [`studio_model`] as a newer version of Studio saves it,
+    /// with a property that older versions didn't save.
+    fn newer_studio_model(name: &str, transparency: f32, new_property: bool) -> Vec<u8> {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let part = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("Part")
+                .with_name(name)
+                .with_property("Transparency", transparency)
+                .with_property("PropertyFromNewerStudio", new_property),
+        );
+
+        let mut output = Vec::new();
+        rbx_binary::to_writer(&mut output, &dom, &[part]).unwrap();
+        output
+    }
+
+    #[test]
+    fn studio_updates_that_save_new_properties_do_not_change_the_file() {
+        let fixture = fixture();
+        let path = fixture.assets.join("Rock.rbxm");
+        fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op("Rock.rbxm", studio_model("Rock", 0.5))],
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // Studio was updated and saves a property it didn't save before, so
+        // its version of the asset changed without anyone changing it.
+        let plan_with_upload = |model: &[u8]| {
+            let studio = [("Rock.rbxm".to_owned(), hash_bytes(model))];
+            let plan = fixture
+                .store
+                .plan("client", "1", None, fixture.container, &studio, &[])
+                .unwrap();
+            assert_eq!(plan.need_upload, vec!["Rock.rbxm".to_owned()]);
+
+            fixture
+                .store
+                .stage(
+                    "client",
+                    fixture.container,
+                    vec![("Rock.rbxm".to_owned(), model.to_vec())],
+                )
+                .unwrap();
+            fixture
+                .store
+                .plan("client", "1", None, fixture.container, &studio, &[])
+                .unwrap()
+        };
+
+        let updated = newer_studio_model("Rock", 0.5, false);
+        assert_in_sync(&plan_with_upload(&updated));
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // Studio's new version is remembered, so the next session doesn't have
+        // to upload it again.
+        let studio = [("Rock.rbxm".to_owned(), hash_bytes(&updated))];
+        let plan = fixture
+            .store
+            .plan("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_in_sync(&plan);
+
+        // Changes to properties the file has are still written.
+        assert_eq!(
+            plan_with_upload(&newer_studio_model("Rock", 0.75, false)).actions,
+            vec![PlanEntry {
+                path: "Rock.rbxm".to_owned(),
+                action: PlanAction::ToFs,
+                reason: None,
+            }]
+        );
+
+        // During live sync, Studio only sends assets that changed, which may
+        // be a change to the new property, so that's written too.
+        let changed = newer_studio_model("Rock", 0.5, true);
+        let failures = fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op("Rock.rbxm", changed.clone())],
+            )
+            .unwrap();
+        assert_eq!(failures, Vec::new());
         assert_eq!(
             fs::read(&path).unwrap(),
             rbxm::canonicalize(&changed).unwrap()
