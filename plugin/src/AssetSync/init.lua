@@ -743,7 +743,18 @@ function AssetSync:__initialSync(container)
 				end
 			end
 		elseif decision == "KeepFiles" then
-			-- Files that don't exist are deleted from Studio when they're read.
+			-- The files win for every asset, not only the conflicting ones, so
+			-- that nothing on disk changes: assets that would have been written
+			-- to files are replaced by their files instead, and ones without a
+			-- file are deleted from Studio when they're read.
+			for _, paths in { toFs, deleteFs } do
+				for _, path in paths do
+					table.insert(toStudio, path)
+				end
+			end
+			table.clear(toFs)
+			table.clear(deleteFs)
+
 			for _, conflict in conflicts do
 				table.insert(toStudio, conflict.path)
 			end

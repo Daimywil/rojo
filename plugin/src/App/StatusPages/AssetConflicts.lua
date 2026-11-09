@@ -122,8 +122,19 @@ local function describe(summary): string
 
 	if #other > 0 then
 		table.insert(lines, "")
-		table.insert(lines, (if #summary.conflicts > 0 then "Also, " else "") .. table.concat(other, ", ") .. ".")
+		if #summary.conflicts > 0 then
+			table.insert(lines, "Also, with Keep Studio, " .. table.concat(other, ", ") .. ".")
+		else
+			table.insert(lines, "With Continue, " .. table.concat(other, ", ") .. ".")
+		end
 	end
+
+	table.insert(lines, "")
+	table.insert(
+		lines,
+		"Keep Files makes Studio match the files on disk for every asset, so nothing on disk changes. "
+			.. "Assets that aren't on disk are removed from Studio, which can be undone."
+	)
 
 	return table.concat(lines, "\n")
 end
@@ -248,21 +259,19 @@ function AssetConflictsPage:render()
 				}),
 			}),
 
-			KeepFiles = if hasConflicts
-				then e(TextButton, {
-					text = "Keep Files",
-					style = "Bordered",
-					transparency = self.props.transparency,
-					layoutOrder = 2,
-					onClick = function()
-						self.props.onDecision("KeepFiles")
-					end,
-				}, {
-					Tip = e(Tooltip.Trigger, {
-						text = "Replace these assets in Studio with the files on disk",
-					}),
-				})
-				else nil,
+			KeepFiles = e(TextButton, {
+				text = "Keep Files",
+				style = "Bordered",
+				transparency = self.props.transparency,
+				layoutOrder = 2,
+				onClick = function()
+					self.props.onDecision("KeepFiles")
+				end,
+			}, {
+				Tip = e(Tooltip.Trigger, {
+					text = "Make Studio match the files on disk, without changing any files",
+				}),
+			}),
 
 			KeepStudio = e(TextButton, {
 				text = if hasConflicts then "Keep Studio" else "Continue",
