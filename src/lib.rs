@@ -20,6 +20,7 @@ mod project;
 mod resolution;
 mod rojo_ref;
 mod serve_session;
+mod server_registry;
 mod session_id;
 mod snapshot;
 mod snapshot_middleware;

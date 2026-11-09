@@ -17,6 +17,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::{
     assets::{AckEntry, AssetMessage, Group, Hash, WriteOp},
     serve_session::ServeSession,
+    server_registry,
     session_id::SessionId,
     snapshot::{InstanceWithMeta, PatchSet, PatchUpdate},
     web::{
@@ -27,8 +28,9 @@ use crate::{
             AssetsPlanResponse, AssetsReadRequest, AssetsReadResponse, AssetsResponse,
             AssetsSessionRequest, AssetsSocketPacket, AssetsStageRequest, AssetsWriteRequest,
             AssetsWriteResponse, ErrorResponse, Instance, MessagesPacket, OpenResponse,
-            ReadResponse, ServerInfoResponse, SocketPacket, SocketPacketBody, SocketPacketType,
-            SubscribeMessage, WriteRequest, WriteResponse, PROTOCOL_VERSION, SERVER_VERSION,
+            ReadResponse, ServerInfoResponse, ServersResponse, SocketPacket, SocketPacketBody,
+            SocketPacketType, SubscribeMessage, WriteRequest, WriteResponse, PROTOCOL_VERSION,
+            SERVER_VERSION,
         },
         origin::canonical,
         util::{deserialize_msgpack, msgpack, msgpack_ok, serialize_msgpack},
@@ -47,6 +49,7 @@ pub async fn call(
 
     match (request.method(), request.uri().path()) {
         (&Method::GET, "/api/rojo") => service.handle_api_rojo().await,
+        (&Method::GET, "/api/servers") => handle_api_servers().await,
         (&Method::GET, path) if path.starts_with("/api/read/") => {
             service.handle_api_read(request).await
         }
@@ -132,6 +135,20 @@ pub async fn call(
         (_method, path) => msgpack(
             ErrorResponse::not_found(format!("Route not found: {}", path)),
             StatusCode::NOT_FOUND,
+        ),
+    }
+}
+
+/// Lists every Rojo server running on this machine. Also served on the
+/// discovery port, which isn't tied to a project.
+pub async fn handle_api_servers() -> Response<Body> {
+    // Telling which servers are still running means connecting to each of
+    // them, which blocks.
+    match tokio::task::spawn_blocking(server_registry::list).await {
+        Ok(servers) => msgpack_ok(ServersResponse { servers }),
+        Err(err) => msgpack(
+            ErrorResponse::internal_error(format!("Could not list Rojo servers: {err}")),
+            StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }
 }

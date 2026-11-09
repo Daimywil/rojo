@@ -167,6 +167,15 @@ pub struct ServerInfoResponse {
     pub root_instance_id: Ref,
 }
 
+/// Response body from /api/servers
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServersResponse {
+    /// Every Rojo server running on this machine, including the one that
+    /// answered, by port.
+    pub servers: Vec<crate::server_registry::ServerEntry>,
+}
+
 /// Response body from /api/read/{id}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

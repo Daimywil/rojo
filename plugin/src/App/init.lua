@@ -20,6 +20,7 @@ local strict = require(Plugin.strict)
 local Dictionary = require(Plugin.Dictionary)
 local ServeSession = require(Plugin.ServeSession)
 local ApiContext = require(Plugin.ApiContext)
+local ServerDiscovery = require(Plugin.ServerDiscovery)
 local PatchSet = require(Plugin.PatchSet)
 local PatchTree = require(Plugin.PatchTree)
 local preloadAssets = require(Plugin.preloadAssets)
@@ -55,6 +56,8 @@ local ASSET_PROMPT_MIN_SHOWN = 0.5
 -- How long connecting may still take after a prompt shown in a popup is answered before the panel is opened to show
 -- how it's going, in seconds
 local PROGRESS_PANEL_DELAY = 1
+-- How often running Rojo servers are looked for while the panel shows them, in seconds
+local SERVER_DISCOVERY_INTERVAL = 5
 
 local function escapeRichText(text: string): string
 	return (string.gsub(text, "[&<>]", {
@@ -157,6 +160,7 @@ function App:init()
 
 	if RunService:IsEdit() then
 		self:checkForUpdates()
+		self:startServerDiscovery()
 
 		self:startSyncReminderPolling()
 		self.disconnectSyncReminderPollingChanged = Settings:onChanged("syncReminderPolling", function(enabled)
@@ -209,7 +213,20 @@ function App:init()
 	end)
 end
 
+function App:didUpdate(_, previousState)
+	-- The list is brought up to date as soon as it's shown, rather than at the next scheduled check
+	local wasShowingServers = previousState.guiEnabled and previousState.appStatus == AppStatus.NotConnected
+	if self:isShowingServers() and not wasShowingServers then
+		task.spawn(self.refreshServers, self)
+	end
+end
+
 function App:willUnmount()
+	self.unmounted = true
+	if self.serverDiscoveryThread ~= nil then
+		task.cancel(self.serverDiscoveryThread)
+	end
+
 	self:endSession()
 
 	self.waypointConnection:Disconnect()
@@ -375,6 +392,50 @@ function App:getHostAndPort()
 	local port = self.port:getValue()
 
 	return if #host > 0 then host else Config.defaultHost, if #port > 0 then port else Config.defaultPort
+end
+
+-- Whether the panel is showing the list of running servers, which is the only time it's worth looking for them
+function App:isShowingServers(): boolean
+	return self.state.guiEnabled and self.state.appStatus == AppStatus.NotConnected
+end
+
+-- Looks for running Rojo servers and shows them in the panel, unless it's already looking
+function App:refreshServers()
+	if self.findingServers or not self:isShowingServers() then
+		return
+	end
+	self.findingServers = true
+
+	-- Servers from before Rojo kept track of them can only be found on the ports this place is known to use
+	local host = self:getHostAndPort()
+	local knownPorts = { self.port:getValue(), self:getLastConnectionPort(), self:getPriorSyncInfo().port }
+
+	ServerDiscovery.find(host, knownPorts)
+		:andThen(function(servers)
+			if not self.unmounted and not ServerDiscovery.same(self.state.servers, servers) then
+				self:setState({
+					servers = servers,
+				})
+			end
+		end)
+		:finally(function()
+			self.findingServers = false
+		end)
+end
+
+function App:startServerDiscovery()
+	self.serverDiscoveryThread = task.spawn(function()
+		while true do
+			self:refreshServers()
+			task.wait(SERVER_DISCOVERY_INTERVAL)
+		end
+	end)
+end
+
+function App:connectToServer(server)
+	self.setHost(server.host)
+	self.setPort(server.port)
+	self:startSession()
 end
 
 function App:isSyncLockAvailable()
@@ -1057,7 +1118,8 @@ function App:render()
 
 					initDockState = Enum.InitialDockState.Right,
 					overridePreviousState = false,
-					floatingSize = Vector2.new(320, 210),
+					-- Tall enough for a few running servers above the address entry
+					floatingSize = Vector2.new(320, 360),
 					minimumSize = Vector2.new(300, 210),
 
 					zIndexBehavior = Enum.ZIndexBehavior.Sibling,
@@ -1081,6 +1143,11 @@ function App:render()
 						onHostChange = self.setHost,
 						port = self.port,
 						onPortChange = self.setPort,
+
+						servers = self.state.servers,
+						onConnectToServer = function(server)
+							self:connectToServer(server)
+						end,
 
 						onConnect = function()
 							self:startSession()

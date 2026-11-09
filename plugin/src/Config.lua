@@ -24,4 +24,6 @@ return strict("Config", {
 	protocolVersion = 5,
 	defaultHost = "localhost",
 	defaultPort = "34872",
+	-- One of the running Rojo servers always listens here, to list all of them
+	discoveryPort = "34871",
 })

@@ -10,18 +10,19 @@ mod ui;
 mod util;
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use hyper::{
     server::{conn::AddrStream, Server},
     service::{make_service_fn, service_fn},
-    Body, Request,
+    Body, Method, Request, StatusCode,
 };
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 
-use crate::serve_session::ServeSession;
+use crate::{serve_session::ServeSession, server_registry};
 
 pub struct LiveServer {
     serve_session: Arc<ServeSession>,
@@ -96,9 +97,78 @@ impl LiveServer {
         // Binding succeeded, so it's now safe to tell the user we're listening.
         on_listening();
 
+        let handle = rt.handle().clone();
+        std::thread::Builder::new()
+            .name("Rojo discovery".to_owned())
+            .spawn(move || hold_discovery_port(handle))
+            .context("Could not start listening on the discovery port")?;
+
         rt.block_on(server)
             .context("The Rojo web server encountered a fatal error")?;
 
         Ok(())
+    }
+}
+
+/// How often a server that doesn't hold the discovery port tries to take it
+/// over, which it can once the server holding it stops.
+const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Listens on the discovery port whenever no other Rojo server does, so the
+/// plugin can always find the list of running servers there (see
+/// [`server_registry`]). Runs for as long as the process does.
+fn hold_discovery_port(handle: Handle) {
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, server_registry::DISCOVERY_PORT));
+    let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), &[]);
+
+    loop {
+        // Bound with the standard library rather than hyper so that a port
+        // another server holds fails right away, without logging an error.
+        if let Ok(listener) = std::net::TcpListener::bind(address) {
+            log::debug!("Listening for Rojo server discovery on {address}");
+
+            let allowed_hosts = allowed_hosts.clone();
+            let result = handle.block_on(async move {
+                listener.set_nonblocking(true)?;
+
+                let make_service = make_service_fn(move |_: &AddrStream| {
+                    let allowed_hosts = allowed_hosts.clone();
+
+                    async move {
+                        Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
+                            let allowed_hosts = allowed_hosts.clone();
+
+                            async move {
+                                if let Some(response) =
+                                    origin::check_request_origin(&req, allowed_hosts.as_ref())
+                                {
+                                    return Ok::<_, Infallible>(response);
+                                }
+
+                                Ok(match (req.method(), req.uri().path()) {
+                                    (&Method::GET, "/api/servers") => {
+                                        api::handle_api_servers().await
+                                    }
+                                    _ => util::response(
+                                        StatusCode::NOT_FOUND,
+                                        "text/plain",
+                                        "Only /api/servers is served on the discovery port",
+                                    ),
+                                })
+                            }
+                        }))
+                    }
+                });
+
+                Server::from_tcp(listener)?.serve(make_service).await?;
+                anyhow::Ok(())
+            });
+
+            if let Err(err) = result {
+                log::debug!("Stopped listening for Rojo server discovery: {err:#}");
+            }
+        }
+
+        std::thread::sleep(DISCOVERY_RETRY_INTERVAL);
     }
 }

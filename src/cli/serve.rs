@@ -9,7 +9,11 @@ use clap::Parser;
 use memofs::Vfs;
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
-use crate::{serve_session::ServeSession, web::LiveServer};
+use crate::{
+    serve_session::ServeSession,
+    server_registry::{self, ServerEntry},
+    web::LiveServer,
+};
 
 use super::{resolve_path, GlobalOptions};
 
@@ -71,12 +75,30 @@ impl ServeCommand {
             self.allowed_hosts
         };
 
+        let entry = ServerEntry::new(
+            port,
+            ip,
+            session.project_name().to_owned(),
+            session.root_project().file_location.clone(),
+        );
         let server = LiveServer::new(session);
+
+        // Kept until the server stops, so the plugin can find it (see
+        // `server_registry`).
+        let mut registration = None;
 
         server.start((ip, port).into(), allowed_hosts, || {
             let _ = show_start_message(ip, port, global.color.into());
+
+            match server_registry::register(&entry) {
+                Ok(registered) => registration = Some(registered),
+                Err(err) => log::warn!(
+                    "Could not register this server, so the Studio plugin won't list it: {err}"
+                ),
+            }
         })?;
 
+        drop(registration);
         Ok(())
     }
 }
