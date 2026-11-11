@@ -627,6 +627,7 @@ function ServeSession:__startAssetSync()
 		progress = function(text)
 			self:setLoadingText(text)
 		end,
+		upgradeFiles = Settings:get("upgradeAssetFiles"),
 	})
 
 	return self.__assetSync:start()

@@ -13,6 +13,7 @@ local defaultSettings = {
 	openScriptsExternally = false,
 	twoWaySync = false,
 	syncAssets = true,
+	upgradeAssetFiles = true,
 	autoReconnect = false,
 	showNotifications = true,
 	enableSyncFallback = true,

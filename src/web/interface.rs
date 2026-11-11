@@ -313,6 +313,10 @@ pub struct AssetHash {
     pub hash: Vec<u8>,
 }
 
+fn default_upgrade_files() -> bool {
+    true
+}
+
 /// Request body for POST /api/assets/plan
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -333,6 +337,11 @@ pub struct AssetsPlanRequest {
     /// so in particular, their files are never deleted.
     #[serde(default)]
     pub skipped: Vec<String>,
+    /// Whether files that lack properties Studio saves, like files from an
+    /// older version of Studio, should be planned to be written to bring
+    /// them up to date.
+    #[serde(default = "default_upgrade_files")]
+    pub upgrade_files: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -413,6 +422,10 @@ pub struct AssetAck {
 #[serde(rename_all = "camelCase")]
 pub struct AssetsAckRequest {
     pub session_id: SessionId,
+    /// The client that uploaded what Studio serializes the applied assets
+    /// to, if it did.
+    #[serde(default)]
+    pub client_id: Option<String>,
     pub place_id: String,
     pub container: Ref,
     /// Files that were applied to Studio.
@@ -504,6 +517,10 @@ pub struct AssetsReadResponse {
     pub session_id: SessionId,
     /// The requested files. Files that no longer exist are left out.
     pub files: Vec<AssetFile>,
+    /// Files that exist but can't be read or aren't valid models right now,
+    /// like ones another program is still writing.
+    #[serde(default)]
+    pub unreadable: Vec<String>,
 }
 
 /// Request body for POST /api/assets/known

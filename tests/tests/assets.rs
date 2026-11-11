@@ -105,6 +105,7 @@ impl Assets<'_> {
                 container: self.container,
                 assets,
                 skipped: Vec::new(),
+                upgrade_files: true,
             },
         )
     }
@@ -300,6 +301,170 @@ fn first_sync_exports_studio_assets() {
         let plan = assets.plan("1", studio);
         assert!(plan.actions.is_empty());
         assert!(!plan.first_sync);
+    });
+}
+
+#[test]
+fn files_from_before_a_studio_update_are_brought_up_to_date() {
+    with_assets(|session, assets| {
+        let file = session.path().join("assets").join("Rock.rbxm");
+        let response = assets.write(vec![write_op("Rock.rbxm", studio_model("Rock", 0.5))]);
+        assert!(response.failures.is_empty());
+        let before = fs::read(&file).unwrap();
+
+        // Studio was updated and saves a property it didn't save before. The
+        // asset serializes differently now, though nobody changed it.
+        let updated = {
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let part = dom.insert(
+                dom.root_ref(),
+                InstanceBuilder::new("Part")
+                    .with_name("Rock")
+                    .with_property("Transparency", 0.5f32)
+                    .with_property("PropertyFromNewerStudio", false),
+            );
+
+            let mut output = Vec::new();
+            rbx_binary::to_writer(&mut output, &dom, &[part]).unwrap();
+            output
+        };
+        let studio = vec![AssetHash {
+            path: "Rock.rbxm".to_owned(),
+            hash: hash(&updated),
+        }];
+
+        let plan = |upgrade_files: bool| -> AssetsPlanResponse {
+            session.post_api_assets(
+                "plan",
+                &AssetsPlanRequest {
+                    session_id: assets.session_id,
+                    client_id: "studio".to_owned(),
+                    place_id: "1".to_owned(),
+                    session: None,
+                    container: assets.container,
+                    assets: studio.clone(),
+                    skipped: Vec::new(),
+                    upgrade_files,
+                },
+            )
+        };
+
+        assert_eq!(plan(true).need_upload, vec!["Rock.rbxm".to_owned()]);
+        let _: AssetsOkResponse = session.post_api_assets(
+            "stage",
+            &AssetsStageRequest {
+                session_id: assets.session_id,
+                client_id: "studio".to_owned(),
+                container: assets.container,
+                assets: vec![AssetContents {
+                    path: "Rock.rbxm".to_owned(),
+                    data: updated.clone(),
+                }],
+            },
+        );
+
+        // The file is written to give it the property, and the plan says
+        // that's why, so the plugin can tell it from an edit.
+        let upgrade = plan(true);
+        assert!(upgrade.need_upload.is_empty());
+        assert_eq!(upgrade.actions.len(), 1);
+        assert_eq!(upgrade.actions[0].action, AssetPlanAction::ToFs);
+        assert_eq!(
+            upgrade.actions[0].reason,
+            Some(AssetPlanReason::NewProperties)
+        );
+        assert_eq!(fs::read(&file).unwrap(), before);
+
+        let _: AssetsOkResponse = session.post_api_assets(
+            "apply",
+            &AssetsApplyRequest {
+                session_id: assets.session_id,
+                client_id: "studio".to_owned(),
+                place_id: "1".to_owned(),
+                container: assets.container,
+                to_fs: vec!["Rock.rbxm".to_owned()],
+                delete_fs: Vec::new(),
+            },
+        );
+
+        let after = fs::read(&file).unwrap();
+        assert_ne!(after, before);
+        let dom = rbx_binary::from_reader(after.as_slice()).unwrap();
+        let rock = dom.get_by_ref(dom.root().children()[0]).unwrap();
+        assert!(rock
+            .properties
+            .keys()
+            .any(|name| name.as_str() == "PropertyFromNewerStudio"));
+
+        // Nothing is left to do, whether files are brought up to date or not.
+        for upgrade_files in [true, false] {
+            let plan = plan(upgrade_files);
+            assert!(plan.need_upload.is_empty());
+            assert!(plan.actions.is_empty());
+        }
+    });
+}
+
+#[test]
+fn places_can_leave_files_from_before_a_studio_update_alone() {
+    with_assets(|session, assets| {
+        let file = session.path().join("assets").join("Rock.rbxm");
+        let response = assets.write(vec![write_op("Rock.rbxm", studio_model("Rock", 0.5))]);
+        assert!(response.failures.is_empty());
+        let before = fs::read(&file).unwrap();
+
+        let updated = {
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let part = dom.insert(
+                dom.root_ref(),
+                InstanceBuilder::new("Part")
+                    .with_name("Rock")
+                    .with_property("Transparency", 0.5f32)
+                    .with_property("PropertyFromNewerStudio", false),
+            );
+
+            let mut output = Vec::new();
+            rbx_binary::to_writer(&mut output, &dom, &[part]).unwrap();
+            output
+        };
+
+        let plan = || -> AssetsPlanResponse {
+            session.post_api_assets(
+                "plan",
+                &AssetsPlanRequest {
+                    session_id: assets.session_id,
+                    client_id: "studio".to_owned(),
+                    place_id: "1".to_owned(),
+                    session: None,
+                    container: assets.container,
+                    assets: vec![AssetHash {
+                        path: "Rock.rbxm".to_owned(),
+                        hash: hash(&updated),
+                    }],
+                    skipped: Vec::new(),
+                    upgrade_files: false,
+                },
+            )
+        };
+
+        assert_eq!(plan().need_upload, vec!["Rock.rbxm".to_owned()]);
+        let _: AssetsOkResponse = session.post_api_assets(
+            "stage",
+            &AssetsStageRequest {
+                session_id: assets.session_id,
+                client_id: "studio".to_owned(),
+                container: assets.container,
+                assets: vec![AssetContents {
+                    path: "Rock.rbxm".to_owned(),
+                    data: updated.clone(),
+                }],
+            },
+        );
+
+        let plan = plan();
+        assert!(plan.need_upload.is_empty());
+        assert!(plan.actions.is_empty());
+        assert_eq!(fs::read(&file).unwrap(), before);
     });
 }
 

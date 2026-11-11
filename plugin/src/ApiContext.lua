@@ -374,6 +374,7 @@ function ApiContext:assetsPlan(request: {
 	container: string,
 	assets: { { path: string, hash: buffer } },
 	skipped: { string },
+	upgradeFiles: boolean?,
 })
 	return self:__assetsRequest("plan", request)
 end
@@ -397,6 +398,7 @@ function ApiContext:assetsApply(request: {
 end
 
 function ApiContext:assetsAck(request: {
+	clientId: string?,
 	placeId: string,
 	container: string,
 	applied: { { path: string, fsHash: buffer, studioHash: buffer } },

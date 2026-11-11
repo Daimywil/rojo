@@ -15,11 +15,16 @@
 //! - Every asset remembers what Studio serialized it to before, so an asset
 //!   that went back to an earlier version is recognized as outdated too.
 //!
+//! Studio also changes how it serializes an asset without anyone editing it,
+//! for example by packing its textures again. So every asset remembers a
+//! hash of Studio's version that leaves such changes out as well, which tells
+//! that Studio still has what it last synced (see `compare::stable_hash`).
+//!
 //! Bases are tracked per place, since the same project can be served into
 //! several places whose assets differ.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     path::{Path, PathBuf},
 };
@@ -57,6 +62,16 @@ pub struct BaseEntry {
 
     /// What Studio serialized the asset to in earlier syncs, oldest first.
     pub older: Vec<ShortHash>,
+
+    /// A hash of Studio's version that stays the same when Studio only
+    /// changes how it serializes the asset, if it's known. Studio's version
+    /// is only uploaded when it's needed, so it isn't always.
+    pub stable: Option<ShortHash>,
+
+    /// Whether the file is known to lack properties that Studio's version
+    /// has, which a file from an older version of Studio does. Such a file is
+    /// brought up to date the next time its place connects.
+    pub behind: bool,
 }
 
 impl BaseEntry {
@@ -65,6 +80,8 @@ impl BaseEntry {
             fs,
             studio,
             older: Vec::new(),
+            stable: None,
+            behind: false,
         }
     }
 
@@ -80,6 +97,8 @@ impl BaseEntry {
 enum BaseEntryRepr {
     Current(String, String),
     WithOlder(String, String, Vec<String>),
+    WithStable(String, String, Vec<String>, String),
+    WithBehind(String, String, Vec<String>, Option<String>, bool),
 }
 
 impl Serialize for BaseEntry {
@@ -87,24 +106,35 @@ impl Serialize for BaseEntry {
         let fs = HEXLOWER.encode(&self.fs);
         let studio = HEXLOWER.encode(&self.studio);
 
-        if self.older.is_empty() {
-            (fs, studio).serialize(serializer)
-        } else {
-            let older: Vec<String> = self
-                .older
+        let older = || -> Vec<String> {
+            self.older
                 .iter()
                 .map(|hash| HEXLOWER.encode(hash))
-                .collect();
-            (fs, studio, older).serialize(serializer)
+                .collect()
+        };
+
+        let stable = self.stable.as_ref().map(|stable| HEXLOWER.encode(stable));
+
+        match stable {
+            _ if self.behind => (fs, studio, older(), stable, true).serialize(serializer),
+            Some(stable) => (fs, studio, older(), stable).serialize(serializer),
+            None if self.older.is_empty() => (fs, studio).serialize(serializer),
+            None => (fs, studio, older()).serialize(serializer),
         }
     }
 }
 
 impl<'de> Deserialize<'de> for BaseEntry {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (fs, studio, older) = match BaseEntryRepr::deserialize(deserializer)? {
-            BaseEntryRepr::Current(fs, studio) => (fs, studio, Vec::new()),
-            BaseEntryRepr::WithOlder(fs, studio, older) => (fs, studio, older),
+        let (fs, studio, older, stable, behind) = match BaseEntryRepr::deserialize(deserializer)? {
+            BaseEntryRepr::Current(fs, studio) => (fs, studio, Vec::new(), None, false),
+            BaseEntryRepr::WithOlder(fs, studio, older) => (fs, studio, older, None, false),
+            BaseEntryRepr::WithStable(fs, studio, older, stable) => {
+                (fs, studio, older, Some(stable), false)
+            }
+            BaseEntryRepr::WithBehind(fs, studio, older, stable, behind) => {
+                (fs, studio, older, stable, behind)
+            }
         };
 
         Ok(BaseEntry {
@@ -115,6 +145,11 @@ impl<'de> Deserialize<'de> for BaseEntry {
                 .map(|hash| decode_hash(hash))
                 .collect::<Result<_, _>>()
                 .map_err(D::Error::custom)?,
+            stable: stable
+                .map(|hash| decode_hash(&hash))
+                .transpose()
+                .map_err(D::Error::custom)?,
+            behind,
         })
     }
 }
@@ -206,6 +241,11 @@ struct StateFile {
     /// the place last started syncing.
     #[serde(default)]
     groups: BTreeMap<String, BTreeMap<String, Vec<Group>>>,
+
+    /// Place ID -> the asset directories whose assets were all looked at.
+    /// See [`BaseState::was_inspected`].
+    #[serde(default)]
+    inspected: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Bases of all assets of a project, persisted to disk.
@@ -306,6 +346,64 @@ impl BaseState {
         self.dirty = true;
     }
 
+    /// Whether Studio's version of every asset of a place was looked at.
+    ///
+    /// Studio's version of an asset is only uploaded when it's needed to
+    /// decide something, which it isn't for an asset neither side changed.
+    /// Only looking at it gives its base a stable hash though, and tells
+    /// whether its file lacks properties Studio saves. Bases recorded before
+    /// Rojo kept track of those know neither. So every asset is asked for
+    /// once, and this remembers that it was, since some assets can't be given
+    /// a stable hash however often they're uploaded.
+    pub fn was_inspected(&self, place: &str, container: &str) -> bool {
+        self.file
+            .inspected
+            .get(place)
+            .is_some_and(|containers| containers.contains(container))
+    }
+
+    pub fn set_inspected(&mut self, place: &str, container: &str) {
+        let added = self
+            .file
+            .inspected
+            .entry(place.to_owned())
+            .or_default()
+            .insert(container.to_owned());
+        if added {
+            self.dirty = true;
+        }
+    }
+
+    /// Marks a place that's about to sync a container for the first time as
+    /// inspected. It has no assets to look at yet, and everything it syncs
+    /// from here on is looked at as it is.
+    pub fn skip_inspecting_new_place(&mut self, place: &str, container: &str) {
+        if self
+            .container(place, container)
+            .is_none_or(BTreeMap::is_empty)
+        {
+            self.set_inspected(place, container);
+        }
+    }
+
+    /// Records whether the file of an asset lacks properties that Studio's
+    /// version has. See [`BaseEntry::behind`].
+    pub fn set_file_behind(&mut self, place: &str, container: &str, path: &str, behind: bool) {
+        let entry = self
+            .file
+            .places
+            .get_mut(place)
+            .and_then(|containers| containers.get_mut(container))
+            .and_then(|bases| bases.get_mut(path));
+
+        if let Some(entry) = entry {
+            if entry.behind != behind {
+                entry.behind = behind;
+                self.dirty = true;
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn get(&self, place: &str, container: &str, path: &str) -> Option<&BaseEntry> {
         self.container(place, container)?.get(path)
@@ -313,7 +411,18 @@ impl BaseState {
 
     /// Records that Studio and the filesystem agree on an asset. Studio's
     /// previous version of it, if any, is remembered as an older version.
-    pub fn record(&mut self, place: &str, container: &str, path: &str, fs: Hash, studio: Hash) {
+    ///
+    /// `stable` is the stable hash of Studio's version, if it's known. What
+    /// was known about a version Studio still has is kept.
+    pub fn record(
+        &mut self,
+        place: &str,
+        container: &str,
+        path: &str,
+        fs: Hash,
+        studio: Hash,
+        stable: Option<ShortHash>,
+    ) {
         let bases = self
             .file
             .places
@@ -323,7 +432,12 @@ impl BaseState {
             .or_default();
 
         match bases.get_mut(path) {
-            Some(entry) if entry.fs == fs && entry.studio == studio => {}
+            Some(entry) if entry.fs == fs && entry.studio == studio => {
+                if stable.is_some() && entry.stable != stable {
+                    entry.stable = stable;
+                    self.dirty = true;
+                }
+            }
             Some(entry) => {
                 if entry.studio != studio {
                     let previous = short_hash(&entry.studio);
@@ -335,13 +449,29 @@ impl BaseState {
                     if entry.older.len() > MAX_OLDER_VERSIONS {
                         entry.older.remove(0);
                     }
+
+                    // What was known about the previous version says nothing
+                    // about this one.
+                    entry.stable = stable;
+                } else if stable.is_some() {
+                    entry.stable = stable;
+                }
+                if entry.fs != fs {
+                    // Nothing is known about another file.
+                    entry.behind = false;
                 }
                 entry.fs = fs;
                 entry.studio = studio;
                 self.dirty = true;
             }
             None => {
-                bases.insert(path.to_owned(), BaseEntry::new(fs, studio));
+                bases.insert(
+                    path.to_owned(),
+                    BaseEntry {
+                        stable,
+                        ..BaseEntry::new(fs, studio)
+                    },
+                );
                 self.dirty = true;
             }
         }
@@ -470,11 +600,16 @@ mod test {
         let path = BaseState::path_for_project(dir.path());
 
         let mut state = BaseState::load(path.clone());
-        state.record("123", "assets", "Tree.rbxm", hash(1), hash(2));
-        state.record("123", "assets", "Tree.rbxm", hash(1), hash(3));
-        state.record("123", "assets", "Folder/Rock.rbxm", hash(3), hash(3));
-        state.record("0", "assets", "Tree.rbxm", hash(4), hash(5));
+        state.record("123", "assets", "Tree.rbxm", hash(1), hash(2), None);
+        state.record("123", "assets", "Tree.rbxm", hash(1), hash(3), None);
+        state.record("123", "assets", "Folder/Rock.rbxm", hash(3), hash(3), None);
+        state.record("0", "assets", "Tree.rbxm", hash(4), hash(5), Some([7; 16]));
         state.set_session("123", "token");
+        state.set_inspected("123", "assets");
+        state.record("7", "assets", "Old.rbxm", hash(1), hash(2), None);
+        state.set_file_behind("7", "assets", "Old.rbxm", true);
+        state.record("7", "assets", "Older.rbxm", hash(1), hash(2), Some([8; 16]));
+        state.set_file_behind("7", "assets", "Older.rbxm", true);
         let machine = state.machine().to_owned();
         state.save_if_dirty().unwrap();
 
@@ -490,11 +625,32 @@ mod test {
         );
         assert_eq!(
             loaded.get("0", "assets", "Tree.rbxm"),
-            Some(&BaseEntry::new(hash(4), hash(5)))
+            Some(&BaseEntry {
+                stable: Some([7; 16]),
+                ..BaseEntry::new(hash(4), hash(5))
+            })
         );
         assert_eq!(loaded.get("999", "assets", "Tree.rbxm"), None);
         assert_eq!(loaded.session("123"), Some("token"));
         assert_eq!(loaded.session("0"), None);
+        assert!(loaded.was_inspected("123", "assets"));
+        assert!(!loaded.was_inspected("123", "other"));
+        assert!(!loaded.was_inspected("0", "assets"));
+        assert_eq!(
+            loaded.get("7", "assets", "Old.rbxm"),
+            Some(&BaseEntry {
+                behind: true,
+                ..BaseEntry::new(hash(1), hash(2))
+            })
+        );
+        assert_eq!(
+            loaded.get("7", "assets", "Older.rbxm"),
+            Some(&BaseEntry {
+                behind: true,
+                stable: Some([8; 16]),
+                ..BaseEntry::new(hash(1), hash(2))
+            })
+        );
         assert_eq!(loaded.machine(), machine);
     }
 
@@ -527,10 +683,10 @@ mod test {
         let (_dir, mut state) = state();
 
         for version in 1..=40 {
-            state.record("1", "assets", "Tree.rbxm", hash(0), hash(version));
+            state.record("1", "assets", "Tree.rbxm", hash(0), hash(version), None);
         }
         // Recording the same version again doesn't add it twice.
-        state.record("1", "assets", "Tree.rbxm", hash(0), hash(40));
+        state.record("1", "assets", "Tree.rbxm", hash(0), hash(40), None);
 
         let entry = state.get("1", "assets", "Tree.rbxm").unwrap().clone();
         assert_eq!(entry.studio, hash(40));
@@ -542,10 +698,58 @@ mod test {
         assert!(!entry.is_older_studio_version(&hash(41)));
 
         // Going back to an older version moves it to the end.
-        state.record("1", "assets", "Tree.rbxm", hash(0), hash(20));
+        state.record("1", "assets", "Tree.rbxm", hash(0), hash(20), None);
         let entry = state.get("1", "assets", "Tree.rbxm").unwrap();
         assert_eq!(entry.older.last(), Some(&short_hash(&hash(40))));
         assert!(!entry.older.contains(&short_hash(&hash(20))));
+    }
+
+    #[test]
+    fn stable_hashes_belong_to_one_studio_version() {
+        let (_dir, mut state) = state();
+        let stable = |state: &BaseState| state.get("1", "assets", "Tree.rbxm").unwrap().stable;
+
+        state.record("1", "assets", "Tree.rbxm", hash(0), hash(1), Some([1; 16]));
+        assert_eq!(stable(&state), Some([1; 16]));
+
+        // Not knowing it this time doesn't forget it, as long as Studio's
+        // version is still the same one. The file may have changed.
+        state.record("1", "assets", "Tree.rbxm", hash(0), hash(1), None);
+        state.record("1", "assets", "Tree.rbxm", hash(9), hash(1), None);
+        assert_eq!(stable(&state), Some([1; 16]));
+
+        // It can become known later.
+        state.record("1", "assets", "Tree.rbxm", hash(9), hash(1), Some([2; 16]));
+        assert_eq!(stable(&state), Some([2; 16]));
+
+        // A new version of Studio's has its own, or none.
+        state.record("1", "assets", "Tree.rbxm", hash(9), hash(2), None);
+        assert_eq!(stable(&state), None);
+        state.record("1", "assets", "Tree.rbxm", hash(9), hash(3), Some([3; 16]));
+        assert_eq!(stable(&state), Some([3; 16]));
+    }
+
+    #[test]
+    fn files_are_only_behind_until_they_change() {
+        let (_dir, mut state) = state();
+        let behind = |state: &BaseState| state.get("1", "assets", "Tree.rbxm").unwrap().behind;
+
+        state.record("1", "assets", "Tree.rbxm", hash(0), hash(1), None);
+        assert!(!behind(&state));
+        state.set_file_behind("1", "assets", "Tree.rbxm", true);
+        assert!(behind(&state));
+
+        // Studio serializing the asset differently says nothing about the file.
+        state.record("1", "assets", "Tree.rbxm", hash(0), hash(2), None);
+        assert!(behind(&state));
+
+        // Another file isn't known to be behind.
+        state.record("1", "assets", "Tree.rbxm", hash(9), hash(2), None);
+        assert!(!behind(&state));
+
+        // Nothing is recorded for assets that were never synced.
+        state.set_file_behind("1", "assets", "Rock.rbxm", true);
+        assert_eq!(state.get("1", "assets", "Rock.rbxm"), None);
     }
 
     #[test]
@@ -592,10 +796,10 @@ mod test {
     #[test]
     fn move_prefix_rekeys_descendants_only() {
         let (_dir, mut state) = state();
-        state.record("1", "assets", "Maps/A.rbxm", hash(1), hash(1));
-        state.record("1", "assets", "Maps/Sub/B.rbxm", hash(2), hash(2));
-        state.record("1", "assets", "Maps2/C.rbxm", hash(3), hash(3));
-        state.record("2", "assets", "Maps/A.rbxm", hash(4), hash(4));
+        state.record("1", "assets", "Maps/A.rbxm", hash(1), hash(1), None);
+        state.record("1", "assets", "Maps/Sub/B.rbxm", hash(2), hash(2), None);
+        state.record("1", "assets", "Maps2/C.rbxm", hash(3), hash(3), None);
+        state.record("2", "assets", "Maps/A.rbxm", hash(4), hash(4), None);
 
         state.move_prefix("1", "assets", "Maps", "Levels");
 

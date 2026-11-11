@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs, io,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
 use anyhow::{bail, Context};
@@ -17,7 +17,7 @@ use crate::{message_queue::MessageQueue, snapshot::RojoTree};
 
 use super::{
     cache::{self, FileEntry},
-    compare::{self, Properties},
+    compare::{self, Properties, PropertySets},
     names::{self, is_under, keys_at_or_under},
     plan::{decide, AssetSides, Decision, PlanAction, PlanReason},
     rbxm::{self, ChunkCompression},
@@ -75,6 +75,17 @@ struct StagedAsset {
     raw: Vec<u8>,
     raw_hash: Hash,
     canonical_hash: Hash,
+
+    /// See [`StagedAsset::stable`].
+    stable: OnceLock<Option<ShortHash>>,
+}
+
+impl StagedAsset {
+    /// The stable hash of Studio's version, if it has one. It's worked out
+    /// when it's first asked for, since that means reading the whole model.
+    fn stable(&self) -> Option<ShortHash> {
+        *self.stable.get_or_init(|| stable_hash(&self.raw))
+    }
 }
 
 /// A file operation requested by a client during live sync.
@@ -112,6 +123,18 @@ pub struct ReadEntry {
     pub path: String,
     pub data: Vec<u8>,
     pub hash: Hash,
+}
+
+/// Asset files read for a client.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReadResult {
+    /// The files that could be read. Files that no longer exist are left out.
+    pub files: Vec<ReadEntry>,
+
+    /// Files that exist but can't be read or aren't valid models right now,
+    /// like ones another program is still writing. They aren't gone, so
+    /// clients must not treat them like files that are.
+    pub unreadable: Vec<String>,
 }
 
 /// An asset that a place synced before.
@@ -173,6 +196,13 @@ pub fn hash_bytes(bytes: &[u8]) -> Hash {
     *blake3::hash(bytes).as_bytes()
 }
 
+/// The stable hash of a model (see [`compare::stable_hash`]), or `None` for a
+/// model with something in it that can't be read. Nothing is assumed about
+/// those, so they're only ever told apart by their bytes.
+fn stable_hash(contents: &[u8]) -> Option<ShortHash> {
+    compare::stable_hash(contents).ok()
+}
+
 /// Hashes the canonical form of a binary model without allocating when the
 /// model is already canonical, which every asset file written by Rojo is.
 fn canonical_hash(contents: &[u8]) -> Result<Hash, rbxm::RbxmError> {
@@ -183,32 +213,33 @@ fn canonical_hash(contents: &[u8]) -> Result<Hash, rbxm::RbxmError> {
     }
 }
 
-/// Whether an asset file only differs from Studio's version of it in ways
-/// Studio changes on its own, like rounding floats or the order of siblings
-/// (see `compare`). The file must still have the contents it was indexed with,
-/// so that a file that's being changed on disk isn't mistaken for either.
+/// Checks whether an asset file only differs from Studio's version of it in
+/// ways Studio changes on its own, like rounding floats or the order of
+/// siblings (see `compare`). If so, returns how the properties they have
+/// relate.
+///
+/// The file must still have the contents with the hash `expected`, so that a
+/// file that's being changed on disk isn't mistaken for either.
 fn file_only_differs_by_noise(
     root: &Path,
     path: &str,
-    entry: &FileEntry,
+    expected: &Hash,
     studio: &[u8],
     properties: Properties,
-) -> bool {
-    let Ok(contents) = fs::read(absolute_path(root, path)) else {
-        return false;
-    };
+) -> Option<PropertySets> {
+    let contents = fs::read(absolute_path(root, path)).ok()?;
 
-    if !canonical_hash(&contents).is_ok_and(|hash| hash == entry.hash) {
-        return false;
+    if !canonical_hash(&contents).is_ok_and(|hash| hash == *expected) {
+        return None;
     }
 
     match compare::compare(&contents, studio, properties) {
-        Ok(()) => true,
+        Ok(property_sets) => Some(property_sets),
         Err(difference) => {
             // This tells why a file was rewritten when nobody changed the
             // asset, which is otherwise impossible to see in a binary file.
             log::debug!("Studio's version of {path} differs from the file: {difference}");
-            false
+            None
         }
     }
 }
@@ -798,9 +829,27 @@ impl AssetStore {
     /// in the place.
     pub fn start_session(&self, place: &str, token: &str) -> anyhow::Result<()> {
         let mut inner = self.lock();
+
+        // A session's token is the ID of its client. Whatever it uploaded to
+        // plan its sync has served its purpose now, and can be as large as
+        // every asset of the place.
+        inner.staging.retain(|(client, _), _| client != token);
+
         inner.state.set_session(place, token);
         inner.state.save_if_dirty()?;
         Ok(())
+    }
+
+    /// Saves what changed about the bases since they were last saved.
+    ///
+    /// Writes made while syncing live don't save them right away, since
+    /// that's all of them every time, for every edit made in Studio. Bases
+    /// that are lost because Rojo stopped before this ran only mean those
+    /// assets are compared again the next time their place connects.
+    pub fn flush(&self) {
+        if let Err(err) = self.lock().state.save_if_dirty() {
+            log::warn!("Could not save asset sync state: {err}");
+        }
     }
 
     /// Scans every asset directory that hasn't been scanned yet.
@@ -1010,6 +1059,15 @@ impl AssetStore {
     ///
     /// Assets found to be in sync have their base updated right away. Nothing
     /// else is changed.
+    ///
+    /// The first time a place syncs a container, Studio's version of every
+    /// asset is asked for, including the ones that are in sync, so that all
+    /// of their bases get a stable hash, and so that it's known which files
+    /// lack properties Studio saves. That goes for places that last synced
+    /// before Rojo kept track of those too.
+    ///
+    /// Files that lack properties Studio saves are planned to be written, to
+    /// bring them up to date (see `plan::decide`).
     pub fn plan(
         &self,
         client: &str,
@@ -1018,6 +1076,51 @@ impl AssetStore {
         container: Ref,
         studio: &[(String, Hash)],
         skipped: &[String],
+    ) -> anyhow::Result<PlanResult> {
+        self.plan_inner(
+            client,
+            place,
+            studio_session,
+            container,
+            studio,
+            skipped,
+            true,
+        )
+    }
+
+    /// Like [`AssetStore::plan`], but leaves files that lack properties Studio
+    /// saves as they are. They're still remembered, to be brought up to date
+    /// by a later plan that does.
+    pub fn plan_without_upgrades(
+        &self,
+        client: &str,
+        place: &str,
+        studio_session: Option<&str>,
+        container: Ref,
+        studio: &[(String, Hash)],
+        skipped: &[String],
+    ) -> anyhow::Result<PlanResult> {
+        self.plan_inner(
+            client,
+            place,
+            studio_session,
+            container,
+            studio,
+            skipped,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_inner(
+        &self,
+        client: &str,
+        place: &str,
+        studio_session: Option<&str>,
+        container: Ref,
+        studio: &[(String, Hash)],
+        skipped: &[String],
+        upgrade_files: bool,
     ) -> anyhow::Result<PlanResult> {
         let mut guard = self.lock();
         let inner = &mut *guard;
@@ -1050,9 +1153,34 @@ impl AssetStore {
                 .filter(|staged| Some(staged.raw_hash) == studio_map.get(path).copied())
         };
 
+        let bases = inner
+            .state
+            .container(place, &key)
+            .cloned()
+            .unwrap_or_default();
+
+        // Stable hashes take reading every instance of a model, so they're
+        // worked out for every upload at once.
+        studio.par_iter().for_each(|(path, _)| {
+            if let Some(staged) = uploaded(path) {
+                staged.stable();
+            }
+        });
+
+        // Whether Studio still has what it last synced, however differently
+        // it serializes that now.
+        let studio_kept_base = |path: &str| {
+            uploaded(path)
+                .and_then(StagedAsset::stable)
+                .zip(bases.get(path).and_then(|base| base.stable))
+                .is_some_and(|(studio, base)| studio == base)
+        };
+
         // Uploads that differ from their files are compared more closely,
         // since Studio may only have rounded some floats differently or put
-        // siblings in another order.
+        // siblings in another order. There's no need to if neither side
+        // changed since they last agreed, unless the file is known to lack
+        // properties: comparing them is what tells that it still does.
         //
         // Properties only one side has are left out too. A new version of
         // Studio saves properties older ones didn't, which changes every asset
@@ -1064,24 +1192,51 @@ impl AssetStore {
             .filter_map(|&path| {
                 let staged = uploaded(path)?;
                 let entry = files.get(path)?;
-                (entry.hash != staged.canonical_hash).then_some((path, staged, entry))
+                let unchanged = bases
+                    .get(path)
+                    .is_some_and(|base| base.fs == entry.hash && !(upgrade_files && base.behind))
+                    && studio_kept_base(path);
+                (entry.hash != staged.canonical_hash && !unchanged).then_some((path, staged, entry))
             })
             .collect();
-        let noise_only: HashSet<&str> = differing
+        let noise_only: HashMap<&str, PropertySets> = differing
             .into_par_iter()
-            .filter(|(path, staged, entry)| {
-                root.as_deref().is_some_and(|root| {
-                    file_only_differs_by_noise(root, path, entry, &staged.raw, Properties::Shared)
-                })
+            .filter_map(|(path, staged, entry)| {
+                let property_sets = file_only_differs_by_noise(
+                    root.as_deref()?,
+                    path,
+                    &entry.hash,
+                    &staged.raw,
+                    Properties::Shared,
+                )?;
+                Some((path, property_sets))
             })
-            .map(|(path, ..)| path)
             .collect();
 
-        let bases = inner
-            .state
-            .container(place, &key)
-            .cloned()
-            .unwrap_or_default();
+        // Whether an uploaded asset's file lacks properties Studio saves, if
+        // the two were compared. Files with the very same contents as Studio's
+        // version don't.
+        let file_is_behind = |path: &str| {
+            let staged = uploaded(path)?;
+            match noise_only.get(path) {
+                Some(property_sets) => Some(*property_sets == PropertySets::StudioHasMore),
+                None => files
+                    .get(path)
+                    .is_some_and(|entry| entry.hash == staged.canonical_hash)
+                    .then_some(false),
+            }
+        };
+
+        // Without a stable hash, an asset that Studio serializes differently
+        // later on, without anyone changing it, can only be compared with its
+        // file. That rewrites every file from an older version of Studio,
+        // which doesn't hold the properties newer ones save. And without
+        // looking at Studio's version, there's no telling which files those
+        // are.
+        //
+        // A place that never synced has no bases to look at, and everything
+        // it syncs from here on is looked at as it is.
+        let inspect = !bases.is_empty() && !inner.state.was_inspected(place, &key);
 
         // A place that never had a session recorded can't have lost one.
         let place_saved = inner
@@ -1110,8 +1265,10 @@ impl AssetStore {
                     files
                         .get(path)
                         .is_some_and(|entry| entry.hash == staged.canonical_hash)
-                        || noise_only.contains(path)
+                        || noise_only.contains_key(path)
                 }),
+                studio_matches_base: studio_kept_base(path),
+                file_lacks_properties: upgrade_files && file_is_behind(path) == Some(true),
                 fs: files.get(path).map(|entry| entry.hash),
                 base: bases.get(path),
                 place_saved,
@@ -1120,7 +1277,26 @@ impl AssetStore {
             match decide(sides) {
                 Decision::NeedsUpload => result.need_upload.push(path.to_owned()),
                 Decision::Action(PlanAction::InSync, _) => {
-                    agreed.push((path.to_owned(), sides.fs.zip(sides.studio)));
+                    // Studio's version of an asset that's in sync is still
+                    // needed the first time, and to bring a file up to date
+                    // that's known to lack properties.
+                    let staged = uploaded(path);
+                    let known_behind = bases.get(path).is_some_and(|base| base.behind);
+                    if (inspect || (upgrade_files && known_behind))
+                        && staged.is_none()
+                        && sides.studio.is_some()
+                        && sides.fs.is_some()
+                    {
+                        result.need_upload.push(path.to_owned());
+                        continue;
+                    }
+
+                    agreed.push((
+                        path.to_owned(),
+                        sides.fs.zip(sides.studio),
+                        staged.and_then(StagedAsset::stable),
+                        file_is_behind(path),
+                    ));
                 }
                 Decision::Action(action, reason) => result.actions.push(PlanEntry {
                     path: path.to_owned(),
@@ -1130,11 +1306,22 @@ impl AssetStore {
             }
         }
 
-        for (path, hashes) in agreed {
+        for (path, hashes, stable, behind) in agreed {
             match hashes {
-                Some((fs, studio)) => inner.state.record(place, &key, &path, fs, studio),
+                Some((fs, studio)) => {
+                    inner.state.record(place, &key, &path, fs, studio, stable);
+                    if let Some(behind) = behind {
+                        inner.state.set_file_behind(place, &key, &path, behind);
+                    }
+                }
                 None => inner.state.remove(place, &key, &path),
             }
+        }
+
+        // Every asset was looked at now. Assets that are synced from here on
+        // are looked at as they are.
+        if result.need_upload.is_empty() {
+            inner.state.set_inspected(place, &key);
         }
 
         if let Err(err) = inner.state.save_if_dirty() {
@@ -1169,6 +1356,7 @@ impl AssetStore {
                     raw_hash: hash_bytes(&raw),
                     canonical_hash: hash_bytes(&canonical),
                     raw,
+                    stable: OnceLock::new(),
                 };
                 Ok((path, staged))
             })
@@ -1222,7 +1410,10 @@ impl AssetStore {
             )
             .collect();
 
-        let (changes, failures) = execute_ops(inner, index, place, ops);
+        let (changes, failures) = execute_ops(inner, index, place, ops, WriteMode::Planned);
+        if let Err(err) = inner.state.save_if_dirty() {
+            log::warn!("Could not save asset sync state: {err}");
+        }
         drop(guard);
 
         self.push_changes(container, changes, Some(client));
@@ -1236,22 +1427,85 @@ impl AssetStore {
 
     /// Records that a client applied files to Studio, or deleted assets from
     /// Studio because their files were deleted.
+    ///
+    /// Clients upload what Studio serializes the applied assets to first (see
+    /// [`AssetStore::stage`]), which `client` is for. Studio doesn't serialize
+    /// an asset to what its file holds: it saves properties the file may not
+    /// have yet, for one. Knowing what Studio made of a file is what later
+    /// tells that Studio still has just that, whatever its file looks like.
     pub fn ack(
         &self,
+        client: Option<&str>,
         place: &str,
         container: Ref,
         applied: &[AckEntry],
         removed: &[String],
     ) -> anyhow::Result<()> {
+        let (staged, root) = {
+            let mut inner = self.lock();
+            let index = inner.scanned(container)?;
+            let staged = client
+                .and_then(|client| inner.staging.remove(&(client.to_owned(), container)))
+                .unwrap_or_default();
+            (staged, inner.containers[index].canonical_root.clone())
+        };
+
+        // Stable hashes take reading every instance of a model, and so does
+        // telling whether Studio made more of a file than it holds, so both
+        // are worked out without holding the lock.
+        //
+        // A file that lacks properties Studio saves isn't written here: the
+        // user just got it, from git for example, and has it change right
+        // away otherwise. It's brought up to date the next time the place
+        // connects, along with every other file like it.
+        let learned: Vec<(Option<ShortHash>, bool)> = applied
+            .par_iter()
+            .map(|entry| {
+                let Some(staged) = staged
+                    .get(&entry.path)
+                    .filter(|staged| staged.raw_hash == entry.studio_hash)
+                else {
+                    return (None, false);
+                };
+
+                let property_sets = root
+                    .as_deref()
+                    .filter(|_| names::is_valid_unit_path(&entry.path))
+                    .and_then(|root| {
+                        file_only_differs_by_noise(
+                            root,
+                            &entry.path,
+                            &entry.fs_hash,
+                            &staged.raw,
+                            Properties::Shared,
+                        )
+                    });
+
+                (
+                    staged.stable(),
+                    property_sets == Some(PropertySets::StudioHasMore),
+                )
+            })
+            .collect();
+
         let mut guard = self.lock();
         let inner = &mut *guard;
         let index = inner.scanned(container)?;
         let key = inner.containers[index].info.key.clone();
+        inner.state.skip_inspecting_new_place(place, &key);
 
-        for entry in applied {
+        for (entry, (stable, behind)) in applied.iter().zip(learned) {
+            inner.state.record(
+                place,
+                &key,
+                &entry.path,
+                entry.fs_hash,
+                entry.studio_hash,
+                stable,
+            );
             inner
                 .state
-                .record(place, &key, &entry.path, entry.fs_hash, entry.studio_hash);
+                .set_file_behind(place, &key, &entry.path, behind);
         }
 
         for path in removed {
@@ -1327,7 +1581,7 @@ impl AssetStore {
         let inner = &mut *guard;
         let index = inner.scanned(container)?;
 
-        let (changes, failures) = execute_ops(inner, index, place, ops);
+        let (changes, failures) = execute_ops(inner, index, place, ops, WriteMode::Live);
         drop(guard);
 
         self.push_changes(container, changes, Some(client));
@@ -1336,42 +1590,71 @@ impl AssetStore {
     }
 
     /// Reads asset files, compressed for sending to Studio.
-    pub fn read(&self, container: Ref, paths: &[String]) -> anyhow::Result<Vec<ReadEntry>> {
+    ///
+    /// A file that can't be read doesn't fail the others. Tools like git
+    /// change many files at once, and one of them still being written when
+    /// it's read would otherwise keep every other change from being applied.
+    pub fn read(&self, container: Ref, paths: &[String]) -> anyhow::Result<ReadResult> {
+        enum Outcome {
+            Read(ReadEntry),
+            Missing,
+            Unreadable(String),
+        }
+
         let root = {
             let mut inner = self.lock();
             let index = inner.scanned(container)?;
             inner.containers[index].canonical_root.clone().unwrap()
         };
 
-        paths
-            .par_iter()
-            .filter_map(|path| {
-                if !names::is_valid_unit_path(path) {
-                    return Some(Err(anyhow::anyhow!("Invalid asset path {path:?}")));
-                }
+        for path in paths {
+            if !names::is_valid_unit_path(path) {
+                bail!("Invalid asset path {path:?}");
+            }
+        }
 
+        let outcomes: Vec<Outcome> = paths
+            .par_iter()
+            .map(|path| {
                 let contents = match fs::read(absolute_path(&root, path)) {
                     Ok(contents) => contents,
                     // The file was deleted since the client asked for it. The
                     // client will hear about that separately.
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
-                    Err(err) => return Some(Err(err.into())),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => return Outcome::Missing,
+                    Err(err) => {
+                        log::debug!("Could not read asset {path}: {err}");
+                        return Outcome::Unreadable(path.clone());
+                    }
                 };
 
-                let result = (|| -> anyhow::Result<ReadEntry> {
+                let result = (|| -> Result<Outcome, rbxm::RbxmError> {
                     let canonical = rbxm::canonicalize(&contents)?;
                     let hash = hash_bytes(&canonical);
                     let data = rbxm::recompress(&canonical, ChunkCompression::Lz4)?;
-                    Ok(ReadEntry {
+                    Ok(Outcome::Read(ReadEntry {
                         path: path.clone(),
                         data,
                         hash,
-                    })
+                    }))
                 })();
 
-                Some(result.with_context(|| format!("Could not read asset {path}")))
+                result.unwrap_or_else(|err| {
+                    log::debug!("Asset {path} is not a valid Roblox model right now: {err}");
+                    Outcome::Unreadable(path.clone())
+                })
             })
-            .collect()
+            .collect();
+
+        let mut result = ReadResult::default();
+        for outcome in outcomes {
+            match outcome {
+                Outcome::Read(entry) => result.files.push(entry),
+                Outcome::Missing => {}
+                Outcome::Unreadable(path) => result.unreadable.push(path),
+            }
+        }
+
+        Ok(result)
     }
 
     /// Returns the path and contents of every asset file in a container, for
@@ -1493,6 +1776,8 @@ struct WrittenFile {
     path: String,
     entry: FileEntry,
     raw_hash: Hash,
+    /// The stable hash of what Studio sent.
+    stable: Option<ShortHash>,
 }
 
 /// Removes the index entry of the file `path`, or of everything under the
@@ -1512,8 +1797,22 @@ fn take_index_entries(
         .collect()
 }
 
+/// Why assets are written to files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// Studio reported them as changed while syncing live. It does that
+    /// whenever it serializes an asset differently, so a file is only written
+    /// if its asset turns out to have changed.
+    Live,
+
+    /// A sync was planned with these writes, which settled that the files
+    /// have to be written. That includes files that only lack properties
+    /// Studio saves, which wouldn't be written otherwise.
+    Planned,
+}
+
 /// Performs file operations on a container, keeping its index and the base
-/// state of the given place up to date.
+/// state of the given place up to date. The base state isn't saved.
 ///
 /// Removals happen first and writes last, so that a batch can replace a file
 /// with a directory or the other way around.
@@ -1522,6 +1821,7 @@ fn execute_ops(
     index: usize,
     place: &str,
     ops: Vec<WriteOp>,
+    mode: WriteMode,
 ) -> (Changes, Failures) {
     inner.index_changed = true;
 
@@ -1529,6 +1829,7 @@ fn execute_ops(
     let root = inner.containers[index].canonical_root.clone().unwrap();
     let files = inner.containers[index].files.as_mut().unwrap();
     let state = &mut inner.state;
+    state.skip_inspecting_new_place(place, &key);
 
     let mut changes = Vec::new();
     let mut failures = Vec::new();
@@ -1704,12 +2005,14 @@ fn execute_ops(
     }
 
     let known: &BTreeMap<String, FileEntry> = files;
+    let bases = state.container(place, &key);
     let written: Vec<Result<WrittenFile, (String, String)>> = writable
         .into_par_iter()
         .map(|(path, raw)| {
-            let result = (|| -> anyhow::Result<(FileEntry, Hash)> {
+            let result = (|| -> anyhow::Result<(FileEntry, Hash, Option<ShortHash>)> {
                 let canonical = rbxm::canonicalize(&raw)?;
                 let hash = hash_bytes(&canonical);
+                let stable = stable_hash(&canonical);
                 let absolute = absolute_path(&root, &path);
 
                 // Rewriting a file with identical contents would only bump its
@@ -1719,14 +2022,41 @@ fn execute_ops(
                     && fs::metadata(&absolute).is_ok();
 
                 if !unchanged {
+                    // Studio sends an asset whenever it serializes differently,
+                    // which it also does when nobody changed it, for example
+                    // after packing its textures again. If Studio still has
+                    // what it last synced with this file, the file is right as
+                    // it is, even where it doesn't hold the same as Studio's
+                    // version: a file from an older version of Studio lacks
+                    // the properties that newer ones save.
+                    let base = bases.and_then(|bases| bases.get(&path));
+                    let kept_base = existing.filter(|entry| {
+                        mode == WriteMode::Live
+                            && stable.is_some()
+                            && base
+                                .is_some_and(|base| base.fs == entry.hash && base.stable == stable)
+                            && fs::metadata(&absolute).is_ok()
+                    });
+                    if let Some(existing) = kept_base {
+                        return Ok((*existing, hash_bytes(&raw), stable));
+                    }
+
                     // Studio may only have rounded some floats differently or
                     // put siblings in another order, which isn't worth a
                     // change to the file.
                     let noise_only = existing.filter(|entry| {
-                        file_only_differs_by_noise(&root, &path, entry, &canonical, Properties::All)
+                        mode == WriteMode::Live
+                            && file_only_differs_by_noise(
+                                &root,
+                                &path,
+                                &entry.hash,
+                                &canonical,
+                                Properties::All,
+                            )
+                            .is_some()
                     });
                     if let Some(existing) = noise_only {
-                        return Ok((*existing, hash_bytes(&raw)));
+                        return Ok((*existing, hash_bytes(&raw), stable));
                     }
 
                     write_atomic(&absolute, &canonical)?;
@@ -1739,14 +2069,15 @@ fn execute_ops(
                     modified: metadata.modified().ok(),
                 };
 
-                Ok((entry, hash_bytes(&raw)))
+                Ok((entry, hash_bytes(&raw), stable))
             })();
 
             match result {
-                Ok((entry, raw_hash)) => Ok(WrittenFile {
+                Ok((entry, raw_hash, stable)) => Ok(WrittenFile {
                     path,
                     entry,
                     raw_hash,
+                    stable,
                 }),
                 Err(err) => Err((path, format!("{err:#}"))),
             }
@@ -1759,8 +2090,9 @@ fn execute_ops(
                 path,
                 entry,
                 raw_hash,
+                stable,
             }) => {
-                state.record(place, &key, &path, entry.hash, raw_hash);
+                state.record(place, &key, &path, entry.hash, raw_hash, stable);
 
                 let previous = files.insert(path.clone(), entry);
                 if previous.map(|previous| previous.hash) != Some(entry.hash) {
@@ -1771,10 +2103,6 @@ fn execute_ops(
         }
     }
 
-    if let Err(err) = state.save_if_dirty() {
-        log::warn!("Could not save asset sync state: {err}");
-    }
-
     (changes, failures)
 }
 
@@ -1782,7 +2110,7 @@ fn execute_ops(
 mod test {
     use super::*;
 
-    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use rbx_dom_weak::{types::Content, InstanceBuilder, WeakDom};
 
     use crate::snapshot::{InstanceMetadata, InstanceSnapshot};
 
@@ -2094,7 +2422,7 @@ mod test {
     }
 
     #[test]
-    fn studio_updates_that_save_new_properties_do_not_change_the_file() {
+    fn studio_updates_that_save_new_properties_bring_files_up_to_date() {
         let fixture = fixture();
         let path = fixture.assets.join("Rock.rbxm");
         fixture
@@ -2109,35 +2437,39 @@ mod test {
         let before = fs::read(&path).unwrap();
 
         // Studio was updated and saves a property it didn't save before, so
-        // its version of the asset changed without anyone changing it.
-        let plan_with_upload = |model: &[u8]| {
-            let studio = [("Rock.rbxm".to_owned(), hash_bytes(model))];
-            let plan = fixture
-                .store
-                .plan("client", "1", None, fixture.container, &studio, &[])
-                .unwrap();
-            assert_eq!(plan.need_upload, vec!["Rock.rbxm".to_owned()]);
-
-            fixture
-                .store
-                .stage(
-                    "client",
-                    fixture.container,
-                    vec![("Rock.rbxm".to_owned(), model.to_vec())],
-                )
-                .unwrap();
-            fixture
-                .store
-                .plan("client", "1", None, fixture.container, &studio, &[])
-                .unwrap()
-        };
+        // its version of the asset changed without anyone changing it. The
+        // file is written all the same, so that it has the property too.
+        let plan_with_upload =
+            |model: &[u8]| plan_with_upload(&fixture, "1", None, "Rock.rbxm", model);
 
         let updated = newer_studio_model("Rock", 0.5, false);
-        assert_in_sync(&plan_with_upload(&updated));
+        assert_eq!(
+            plan_with_upload(&updated).actions,
+            vec![PlanEntry {
+                path: "Rock.rbxm".to_owned(),
+                action: PlanAction::ToFs,
+                reason: Some(PlanReason::NewProperties),
+            }]
+        );
+        // Planning doesn't write anything yet.
         assert_eq!(fs::read(&path).unwrap(), before);
 
-        // Studio's new version is remembered, so the next session doesn't have
-        // to upload it again.
+        fixture
+            .store
+            .apply(
+                "client",
+                "1",
+                fixture.container,
+                &["Rock.rbxm".to_owned()],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            rbxm::canonicalize(&updated).unwrap()
+        );
+
+        // That's it: the next session has nothing to upload or to write.
         let studio = [("Rock.rbxm".to_owned(), hash_bytes(&updated))];
         let plan = fixture
             .store
@@ -2145,7 +2477,7 @@ mod test {
             .unwrap();
         assert_in_sync(&plan);
 
-        // Changes to properties the file has are still written.
+        // Changes to properties the file has are written as changes.
         assert_eq!(
             plan_with_upload(&newer_studio_model("Rock", 0.75, false)).actions,
             vec![PlanEntry {
@@ -2155,8 +2487,7 @@ mod test {
             }]
         );
 
-        // During live sync, Studio only sends assets that changed, which may
-        // be a change to the new property, so that's written too.
+        // A change to the new property itself is written too.
         let changed = newer_studio_model("Rock", 0.5, true);
         let failures = fixture
             .store
@@ -2172,6 +2503,595 @@ mod test {
             fs::read(&path).unwrap(),
             rbxm::canonicalize(&changed).unwrap()
         );
+    }
+
+    #[test]
+    fn places_can_leave_files_from_older_studio_versions_as_they_are() {
+        let fixture = fixture();
+        let path = fixture.assets.join("Rock.rbxm");
+        fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op("Rock.rbxm", studio_model("Rock", 0.5))],
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // Studio was updated, but this place doesn't bring files up to date.
+        let updated = newer_studio_model("Rock", 0.5, false);
+        let plan = plan_with_upload_as(&fixture, "1", None, "Rock.rbxm", &updated, false);
+        assert_in_sync(&plan);
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // Nothing is uploaded for it the next time either.
+        let studio = [("Rock.rbxm".to_owned(), hash_bytes(&updated))];
+        let plan = fixture
+            .store
+            .plan_without_upgrades("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_in_sync(&plan);
+
+        // The file is remembered to lack a property though, so it's brought
+        // up to date once the place does that, though neither side changed
+        // since.
+        fixture
+            .store
+            .apply("client", "1", fixture.container, &[], &[])
+            .unwrap();
+        assert_eq!(
+            plan_with_upload(&fixture, "1", None, "Rock.rbxm", &updated).actions,
+            vec![PlanEntry {
+                path: "Rock.rbxm".to_owned(),
+                action: PlanAction::ToFs,
+                reason: Some(PlanReason::NewProperties),
+            }]
+        );
+    }
+
+    #[test]
+    fn files_from_newer_studio_versions_are_never_written_for_it() {
+        let fixture = fixture();
+        let path = fixture.assets.join("Wall.rbxm");
+
+        // Someone with a newer version of Studio saved this file. The Studio
+        // this place is open in doesn't save one of its properties, so the
+        // asset loses it when the file is applied.
+        replace_file(
+            &fixture,
+            "Wall.rbxm",
+            &newer_textured_model(0.0, "rbxassetid://100"),
+        );
+        let before = fs::read(&path).unwrap();
+        apply_to_studio(
+            &fixture,
+            "1",
+            "Wall.rbxm",
+            &textured_model("Wall", 0.0, "rbxassetid://100"),
+        );
+
+        // Writing Studio's version would take the property out of the file,
+        // only for the newer Studio to put it back in. So it isn't, neither
+        // for a place that synced the file before...
+        let repacked = textured_model("Wall", 0.0, "rbxassetid://200");
+        let plan = plan_with_upload(&fixture, "1", None, "Wall.rbxm", &repacked);
+        assert_in_sync(&plan);
+
+        // ...nor for one that never did.
+        let elsewhere = textured_model("Wall", 0.0, "rbxassetid://300");
+        let plan = plan_with_upload(&fixture, "2", None, "Wall.rbxm", &elsewhere);
+        assert_in_sync(&plan);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    /// The model of [`studio_model`] with its textures packed into the given
+    /// asset, which Studio picks anew whenever it packs them again.
+    ///
+    /// Studio saves which asset that is as a string on the surface. rbx_binary
+    /// saves that property as another one, so it's put on the part here,
+    /// which rbx_binary doesn't know to have it and saves as it is.
+    fn textured_model(name: &str, transparency: f32, texture_pack: &str) -> Vec<u8> {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let part = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("Part")
+                .with_name(name)
+                .with_property("Transparency", transparency)
+                .with_property("TexturePack", texture_pack),
+        );
+        dom.insert(
+            part,
+            InstanceBuilder::new("SurfaceAppearance")
+                .with_property("ColorMap", Content::from_uri("rbxassetid://1")),
+        );
+
+        let mut output = Vec::new();
+        rbx_binary::to_writer(&mut output, &dom, &[part]).unwrap();
+        output
+    }
+
+    #[test]
+    fn studio_packing_textures_again_does_not_change_the_file() {
+        let fixture = fixture();
+        let packed = textured_model("Wall", 0.0, "rbxassetid://100");
+        let repacked = textured_model("Wall", 0.0, "rbxassetid://200");
+
+        let path = fixture.assets.join("Wall.rbxm");
+        let write = |model: &Vec<u8>| {
+            let failures = fixture
+                .store
+                .write(
+                    "client",
+                    "1",
+                    fixture.container,
+                    vec![write_op("Wall.rbxm", model.clone())],
+                )
+                .unwrap();
+            assert_eq!(failures, Vec::new());
+        };
+
+        // This is what happens right after a file is applied to Studio:
+        // Studio packs its textures again and reports the asset as changed.
+        write(&packed);
+        let before = fs::read(&path).unwrap();
+        write(&repacked);
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // A place that packed them while it wasn't syncing is in sync too,
+        // once its contents were compared.
+        let once_more = textured_model("Wall", 0.0, "rbxassetid://300");
+        let studio = [("Wall.rbxm".to_owned(), hash_bytes(&once_more))];
+        let plan = fixture
+            .store
+            .plan("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_eq!(plan.need_upload, vec!["Wall.rbxm".to_owned()]);
+
+        fixture
+            .store
+            .stage(
+                "client",
+                fixture.container,
+                vec![("Wall.rbxm".to_owned(), once_more)],
+            )
+            .unwrap();
+        let plan = fixture
+            .store
+            .plan("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_in_sync(&plan);
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // Real changes are still written.
+        let changed = textured_model("Wall", 0.5, "rbxassetid://300");
+        write(&changed);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            rbxm::canonicalize(&changed).unwrap()
+        );
+    }
+
+    /// Plans a sync of a single asset after uploading Studio's version of
+    /// it, like the plugin does when the server asks for it.
+    fn plan_with_upload(
+        fixture: &Fixture,
+        place: &str,
+        session: Option<&str>,
+        path: &str,
+        model: &[u8],
+    ) -> PlanResult {
+        plan_with_upload_as(fixture, place, session, path, model, true)
+    }
+
+    /// Like [`plan_with_upload`], for a place that may not bring files up to
+    /// date with the properties Studio saves.
+    fn plan_with_upload_as(
+        fixture: &Fixture,
+        place: &str,
+        session: Option<&str>,
+        path: &str,
+        model: &[u8],
+        upgrade_files: bool,
+    ) -> PlanResult {
+        let studio = [(path.to_owned(), hash_bytes(model))];
+        let plan = || {
+            let store = &fixture.store;
+            if upgrade_files {
+                store.plan("client", place, session, fixture.container, &studio, &[])
+            } else {
+                store.plan_without_upgrades(
+                    "client",
+                    place,
+                    session,
+                    fixture.container,
+                    &studio,
+                    &[],
+                )
+            }
+            .unwrap()
+        };
+        assert_eq!(plan().need_upload, vec![path.to_owned()]);
+
+        fixture
+            .store
+            .stage(
+                "client",
+                fixture.container,
+                vec![(path.to_owned(), model.to_vec())],
+            )
+            .unwrap();
+        plan()
+    }
+
+    /// Replaces an asset file the way `git checkout` does.
+    fn replace_file(fixture: &Fixture, path: &str, model: &[u8]) {
+        let absolute = fixture.assets.join(path);
+        fs::write(&absolute, rbxm::canonicalize(model).unwrap()).unwrap();
+        assert!(fixture.store.handle_fs_change(&absolute));
+    }
+
+    #[test]
+    fn file_changes_win_when_studio_only_serializes_differently() {
+        let fixture = fixture();
+        fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op(
+                    "Wall.rbxm",
+                    textured_model("Wall", 0.0, "rbxassetid://100"),
+                )],
+            )
+            .unwrap();
+
+        // The file changed while the place wasn't syncing, and Studio packed
+        // the asset's textures again, so its version has another hash too.
+        // Studio's version isn't an edit though, so there's nothing to ask.
+        let from_git = textured_model("Wall", 0.5, "rbxassetid://100");
+        replace_file(&fixture, "Wall.rbxm", &from_git);
+
+        let repacked = textured_model("Wall", 0.0, "rbxassetid://200");
+        let plan = plan_with_upload(&fixture, "1", None, "Wall.rbxm", &repacked);
+        assert_eq!(
+            plan.actions,
+            vec![PlanEntry {
+                path: "Wall.rbxm".to_owned(),
+                action: PlanAction::ToStudio,
+                reason: None,
+            }]
+        );
+
+        // An asset that was edited in Studio as well is still a conflict.
+        let edited = textured_model("Wall", 0.25, "rbxassetid://200");
+        let plan = plan_with_upload(&fixture, "1", None, "Wall.rbxm", &edited);
+        assert_eq!(
+            plan.actions,
+            vec![PlanEntry {
+                path: "Wall.rbxm".to_owned(),
+                action: PlanAction::Conflict,
+                reason: Some(PlanReason::BothChanged),
+            }]
+        );
+    }
+
+    /// Does what the plugin does to apply a file to Studio: reads it, and
+    /// reports what Studio serializes the asset to once it's loaded, which is
+    /// `studio`.
+    fn apply_to_studio(fixture: &Fixture, place: &str, path: &str, studio: &[u8]) {
+        let read = fixture
+            .store
+            .read(fixture.container, &[path.to_owned()])
+            .unwrap();
+        assert_eq!(read.files.len(), 1);
+
+        fixture
+            .store
+            .stage(
+                "client",
+                fixture.container,
+                vec![(path.to_owned(), studio.to_vec())],
+            )
+            .unwrap();
+        fixture
+            .store
+            .ack(
+                Some("client"),
+                place,
+                fixture.container,
+                &[AckEntry {
+                    path: path.to_owned(),
+                    fs_hash: read.files[0].hash,
+                    studio_hash: hash_bytes(studio),
+                }],
+                &[],
+            )
+            .unwrap();
+    }
+
+    /// The model of [`textured_model`] as a newer version of Studio saves it,
+    /// with a property that files from older versions don't have.
+    fn newer_textured_model(transparency: f32, texture_pack: &str) -> Vec<u8> {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let part = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("Part")
+                .with_name("Wall")
+                .with_property("Transparency", transparency)
+                .with_property("TexturePack", texture_pack)
+                .with_property("PropertyFromNewerStudio", false),
+        );
+        dom.insert(
+            part,
+            InstanceBuilder::new("SurfaceAppearance")
+                .with_property("ColorMap", Content::from_uri("rbxassetid://1")),
+        );
+
+        let mut output = Vec::new();
+        rbx_binary::to_writer(&mut output, &dom, &[part]).unwrap();
+        output
+    }
+
+    #[test]
+    fn files_from_older_studio_versions_stay_as_they_are_after_being_applied() {
+        let fixture = fixture();
+        let path = fixture.assets.join("Wall.rbxm");
+
+        // The file comes from an older version of Studio, for example through
+        // git. Loading it gives Studio an asset that it saves with a property
+        // the file doesn't have.
+        replace_file(
+            &fixture,
+            "Wall.rbxm",
+            &textured_model("Wall", 0.0, "rbxassetid://100"),
+        );
+        let before = fs::read(&path).unwrap();
+        apply_to_studio(
+            &fixture,
+            "1",
+            "Wall.rbxm",
+            &newer_textured_model(0.0, "rbxassetid://100"),
+        );
+
+        // Studio then packs the asset's textures again and reports it as
+        // changed, though nobody changed it. This is what used to rewrite
+        // files right after they were applied.
+        let write = |model: Vec<u8>| {
+            let failures = fixture
+                .store
+                .write(
+                    "client",
+                    "1",
+                    fixture.container,
+                    vec![write_op("Wall.rbxm", model)],
+                )
+                .unwrap();
+            assert_eq!(failures, Vec::new());
+        };
+        write(newer_textured_model(0.0, "rbxassetid://200"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // The same goes for a place that did so while it wasn't syncing,
+        // whether it was saved since or not, unless it brings files up to
+        // date.
+        fixture.store.start_session("1", "session").unwrap();
+        for (session, texture_pack) in [
+            (Some("session"), "rbxassetid://300"),
+            (Some("another session"), "rbxassetid://400"),
+        ] {
+            let repacked = newer_textured_model(0.0, texture_pack);
+            let plan = plan_with_upload_as(&fixture, "1", session, "Wall.rbxm", &repacked, false);
+            assert_in_sync(&plan);
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+
+        // A place that does writes the file when it connects, never while
+        // it's syncing.
+        let repacked = newer_textured_model(0.0, "rbxassetid://500");
+        assert_eq!(
+            plan_with_upload(&fixture, "1", Some("session"), "Wall.rbxm", &repacked).actions,
+            vec![PlanEntry {
+                path: "Wall.rbxm".to_owned(),
+                action: PlanAction::ToFs,
+                reason: Some(PlanReason::NewProperties),
+            }]
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // An edit is written, along with the property the file didn't have.
+        let edited = newer_textured_model(0.5, "rbxassetid://400");
+        write(edited.clone());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            rbxm::canonicalize(&edited).unwrap()
+        );
+    }
+
+    #[test]
+    fn places_that_synced_before_are_looked_at_once() {
+        let fixture = fixture();
+        let path = fixture.assets.join("Wall.rbxm");
+
+        // The place synced this file with a version of Rojo that only
+        // remembered what the two sides hashed to. The file comes from an
+        // older version of Studio than the one the place is open in.
+        fs::write(
+            &path,
+            rbxm::canonicalize(&textured_model("Wall", 0.0, "rbxassetid://100")).unwrap(),
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        let in_studio = newer_textured_model(0.0, "rbxassetid://100");
+
+        let hex = |hash: Hash| data_encoding::HEXLOWER.encode(&hash);
+        fs::write(
+            BaseState::path_for_project(&fixture.project),
+            format!(
+                r#"{{"version":1,"machine":"0123456789abcdef","places":{{"1":{{"assets":{{"Wall.rbxm":["{}","{}"]}}}}}}}}"#,
+                hex(hash_bytes(&before)),
+                hex(hash_bytes(&in_studio)),
+            ),
+        )
+        .unwrap();
+
+        let store = AssetStore::new(&fixture.project, None);
+        store.refresh_containers(&fixture.tree);
+        store.scan_all().unwrap();
+        let fixture = Fixture { store, ..fixture };
+
+        let ack = |path: &str, studio: &[u8]| {
+            let read = fixture
+                .store
+                .read(fixture.container, &[path.to_owned()])
+                .unwrap();
+            fixture
+                .store
+                .ack(
+                    None,
+                    "1",
+                    fixture.container,
+                    &[AckEntry {
+                        path: path.to_owned(),
+                        fs_hash: read.files[0].hash,
+                        studio_hash: hash_bytes(studio),
+                    }],
+                    &[],
+                )
+                .unwrap();
+        };
+        // Nothing changed, but Studio's version is asked for anyway.
+        let plan = plan_with_upload_as(&fixture, "1", None, "Wall.rbxm", &in_studio, false);
+        assert_in_sync(&plan);
+
+        // That's what tells that Studio packing the asset's textures again
+        // isn't an edit, which comparing it with the file can't: the file
+        // doesn't have every property Studio saves.
+        let failures = fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op(
+                    "Wall.rbxm",
+                    newer_textured_model(0.0, "rbxassetid://200"),
+                )],
+            )
+            .unwrap();
+        assert_eq!(failures, Vec::new());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // It's only asked for once. A base that still has no stable hash
+        // after that, like one of a model that can't be read, is left alone.
+        replace_file(&fixture, "Rock.rbxm", &studio_model("Rock", 0.0));
+        let rock = studio_model("Rock", 0.0);
+        ack("Rock.rbxm", &rock);
+
+        let studio = [
+            (
+                "Wall.rbxm".to_owned(),
+                hash_bytes(&newer_textured_model(0.0, "rbxassetid://200")),
+            ),
+            ("Rock.rbxm".to_owned(), hash_bytes(&rock)),
+        ];
+        let plan = fixture
+            .store
+            .plan_without_upgrades("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_in_sync(&plan);
+
+        // Looking at Studio's version also told that the file lacks a
+        // property, which a place that brings files up to date asks for.
+        let plan = fixture
+            .store
+            .plan("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_eq!(plan.need_upload, vec!["Wall.rbxm".to_owned()]);
+        assert_eq!(plan.actions, Vec::new());
+    }
+
+    #[test]
+    fn files_applied_to_studio_are_recognized_after_studio_packs_their_textures() {
+        let fixture = fixture();
+        let first = textured_model("Wall", 0.0, "rbxassetid://100");
+        replace_file(&fixture, "Wall.rbxm", &first);
+
+        // The plugin reads the file, applies it to Studio, and reports what
+        // Studio serializes the asset to.
+        apply_to_studio(&fixture, "1", "Wall.rbxm", &first);
+
+        // Later, the file changes again and Studio packed the textures of
+        // the version it has again. The file still wins without asking.
+        replace_file(
+            &fixture,
+            "Wall.rbxm",
+            &textured_model("Wall", 0.5, "rbxassetid://100"),
+        );
+        let repacked = textured_model("Wall", 0.0, "rbxassetid://200");
+        let plan = plan_with_upload(&fixture, "1", None, "Wall.rbxm", &repacked);
+        assert_eq!(
+            plan.actions,
+            vec![PlanEntry {
+                path: "Wall.rbxm".to_owned(),
+                action: PlanAction::ToStudio,
+                reason: None,
+            }]
+        );
+
+        // The same goes for a file that was deleted. Studio's version was
+        // uploaded already.
+        fs::remove_file(fixture.assets.join("Wall.rbxm")).unwrap();
+        fixture
+            .store
+            .handle_fs_change(&fixture.assets.join("Wall.rbxm"));
+        let studio = [("Wall.rbxm".to_owned(), hash_bytes(&repacked))];
+        let plan = fixture
+            .store
+            .plan("client", "1", None, fixture.container, &studio, &[])
+            .unwrap();
+        assert_eq!(plan.need_upload, Vec::<String>::new());
+        assert_eq!(
+            plan.actions,
+            vec![PlanEntry {
+                path: "Wall.rbxm".to_owned(),
+                action: PlanAction::DeleteStudio,
+                reason: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn live_writes_are_saved_by_the_next_flush() {
+        let fixture = fixture();
+        let model = studio_model("Rock", 0.0);
+        fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op("Rock.rbxm", model.clone())],
+            )
+            .unwrap();
+
+        let synced_after_restart = || {
+            let next_run = AssetStore::new(&fixture.project, None);
+            next_run.refresh_containers(&fixture.tree);
+            next_run.known("1", fixture.container).unwrap().synced
+        };
+
+        // Bases aren't saved on every write. Losing one only means the asset
+        // is compared again.
+        assert_eq!(synced_after_restart(), Vec::new());
+
+        fixture.store.flush();
+        let synced = synced_after_restart();
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].path, "Rock.rbxm");
+        assert_eq!(synced[0].studio, hash_bytes(&model));
     }
 
     #[test]
@@ -2526,19 +3446,21 @@ mod test {
             .store
             .read(fixture.container, &["Tree.rbxm".to_owned()])
             .unwrap();
-        assert_eq!(read.len(), 1);
-        assert_eq!(rbxm::canonicalize(&read[0].data).unwrap(), changed);
+        assert_eq!(read.unreadable, Vec::<String>::new());
+        assert_eq!(read.files.len(), 1);
+        assert_eq!(rbxm::canonicalize(&read.files[0].data).unwrap(), changed);
 
         // After Studio applied the file, its new serialization is the base.
         let reserialized = studio_model("Tree", 1.0);
         fixture
             .store
             .ack(
+                None,
                 "1",
                 fixture.container,
                 &[AckEntry {
                     path: "Tree.rbxm".to_owned(),
-                    fs_hash: read[0].hash,
+                    fs_hash: read.files[0].hash,
                     studio_hash: hash_bytes(&reserialized),
                 }],
                 &[],
@@ -2557,6 +3479,43 @@ mod test {
             )
             .unwrap();
         assert_in_sync(&plan);
+    }
+
+    #[test]
+    fn files_that_cannot_be_read_do_not_fail_the_others() {
+        let fixture = fixture();
+        fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![
+                    write_op("Rock.rbxm", studio_model("Rock", 0.0)),
+                    write_op("Tree.rbxm", studio_model("Tree", 0.0)),
+                    write_op("Gone.rbxm", studio_model("Gone", 0.0)),
+                ],
+            )
+            .unwrap();
+
+        // Another program is halfway through writing one file, and deleted
+        // another, since the client was told about them.
+        fs::write(fixture.assets.join("Tree.rbxm"), b"<roblox!").unwrap();
+        fs::remove_file(fixture.assets.join("Gone.rbxm")).unwrap();
+
+        let paths = ["Rock.rbxm", "Tree.rbxm", "Gone.rbxm"].map(str::to_owned);
+        let read = fixture.store.read(fixture.container, &paths).unwrap();
+
+        let files: Vec<&str> = read.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(files, ["Rock.rbxm"]);
+        // The file that can't be read still exists, which is not the same
+        // as being deleted.
+        assert_eq!(read.unreadable, ["Tree.rbxm"]);
+
+        assert!(fixture
+            .store
+            .read(fixture.container, &["../Rock.rbxm".to_owned()])
+            .is_err());
     }
 
     #[test]

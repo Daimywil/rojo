@@ -22,6 +22,9 @@ use crate::{
 /// missed.
 const ASSET_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often what asset sync remembers is saved, if it changed.
+const ASSET_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Processes file change events, updates the DOM, and sends those updates
 /// through a channel for other stuff to consume.
 ///
@@ -66,6 +69,7 @@ impl ChangeProcessor {
         // once, like during a git checkout. Rescanning asset directories every
         // so often makes sure Studio still hears about every change.
         let asset_rescan_ticker = crossbeam_channel::tick(ASSET_RESCAN_INTERVAL);
+        let asset_flush_ticker = crossbeam_channel::tick(ASSET_FLUSH_INTERVAL);
 
         let task = JobThreadContext {
             tree,
@@ -93,6 +97,9 @@ impl ChangeProcessor {
                         },
                         recv(asset_rescan_ticker) -> _ => {
                             task.asset_store.rescan_all();
+                        },
+                        recv(asset_flush_ticker) -> _ => {
+                            task.asset_store.flush();
                         },
                         recv(shutdown_receiver) -> _ => {
                             log::trace!("ChangeProcessor shutdown signal received...");

@@ -45,6 +45,10 @@ pub enum PlanReason {
     /// place wasn't saved after it was last synced. The asset may have been
     /// deleted while syncing the changes the place lost.
     NewInUnsavedPlace,
+    /// Nobody changed the asset, but Studio saves properties that its file
+    /// doesn't have yet, which a file from an older version of Studio
+    /// doesn't. Writing Studio's version brings the file up to date.
+    NewProperties,
 }
 
 /// What is known about one asset while planning.
@@ -59,6 +63,19 @@ pub struct AssetSides<'a> {
     /// newer version of Studio started saving, match. Without a file, they
     /// never do.
     pub studio_matches_file: Option<bool>,
+
+    /// Whether Studio's contents are what Studio last synced, apart from
+    /// what Studio changes about how it serializes an asset on its own, like
+    /// the order of siblings or which asset its textures are packed into.
+    /// Only known if the contents were uploaded and the base remembers a
+    /// stable hash, so `false` means it couldn't be told.
+    pub studio_matches_base: bool,
+
+    /// Whether Studio's contents were uploaded and found to be the file's
+    /// with properties the file doesn't have, and nothing else: no property
+    /// the file has is missing from them. Never set for a place that doesn't
+    /// bring files up to date.
+    pub file_lacks_properties: bool,
 
     /// Hash of the asset file, if it exists.
     pub fs: Option<Hash>,
@@ -90,6 +107,10 @@ pub enum Decision {
 ///   the last sync. Studio's version might be older than the file then.
 /// - If both sides changed, their contents are compared. Identical contents
 ///   are in sync, anything else is a conflict.
+/// - Studio serializing an asset differently doesn't have to mean that it
+///   changed. If its contents are still what was last synced, Studio didn't
+///   change: the asset is in sync if the file didn't change either, and the
+///   file wins without asking if it did.
 /// - Contents that only differ by rounding in some floats, the order of
 ///   siblings, `UniqueId`s, or properties only one side has count as
 ///   identical, since Studio changes those on its own. A Studio update that
@@ -102,9 +123,27 @@ pub enum Decision {
 ///   exists on one side is copied to the other. If the place wasn't saved, an
 ///   asset only Studio has may have been deleted since, so that's a conflict.
 ///
+/// - An asset that's in sync but whose file lacks properties Studio saves is
+///   written to the file anyway, to bring it up to date. Left alone, such a
+///   file is rewritten the first time someone edits the asset, with the edit
+///   lost among properties nobody set. That only goes one way: a file with
+///   properties this Studio doesn't save is never written for that, so two
+///   people on different versions of Studio don't keep rewriting each
+///   other's files.
+///
 /// Whenever it isn't clear which side is right, the user gets to decide, so
 /// that nothing is overwritten or deleted by mistake.
 pub fn decide(sides: AssetSides) -> Decision {
+    match decide_contents(sides) {
+        Decision::Action(PlanAction::InSync, _) if sides.file_lacks_properties => {
+            Decision::Action(PlanAction::ToFs, Some(PlanReason::NewProperties))
+        }
+        decision => decision,
+    }
+}
+
+/// Decides what to do with an asset going by its contents alone.
+fn decide_contents(sides: AssetSides) -> Decision {
     use Decision::*;
     use PlanAction::*;
     use PlanReason::*;
@@ -118,6 +157,16 @@ pub fn decide(sides: AssetSides) -> Decision {
     let needs_studio_contents =
         |action: PlanAction, reason: Option<PlanReason>| match sides.studio_matches_file {
             Some(_) => Action(action, reason),
+            None => NeedsUpload,
+        };
+
+    // What to do when Studio's hash changed and the file changed or is gone:
+    // if Studio still has what it last synced, the file's side wins, and
+    // otherwise the user has to pick.
+    let unless_studio_kept_its_base =
+        |file_wins: PlanAction, reason: PlanReason| match sides.studio_matches_file {
+            Some(_) if sides.studio_matches_base => Action(file_wins, None),
+            Some(_) => Action(Conflict, Some(reason)),
             None => NeedsUpload,
         };
 
@@ -138,6 +187,15 @@ pub fn decide(sides: AssetSides) -> Decision {
             match (studio_changed, fs_changed) {
                 (false, false) => Action(InSync, None),
                 (false, true) => Action(ToStudio, None),
+                // Neither side changed since they last agreed. That's so even
+                // if Studio's contents don't match the file: Studio doesn't
+                // serialize an asset to what its file holds, for example when
+                // the file comes from an older version of Studio.
+                (true, false)
+                    if sides.studio_matches_base && sides.studio_matches_file.is_some() =>
+                {
+                    Action(InSync, None)
+                }
                 // Studio's version can still match the file, for example if
                 // only some floats were rounded differently.
                 (true, false) if sides.place_saved => match sides.studio_matches_file {
@@ -146,7 +204,10 @@ pub fn decide(sides: AssetSides) -> Decision {
                     None => NeedsUpload,
                 },
                 (true, false) => compare(UnsavedPlace),
-                (true, true) => compare(BothChanged),
+                (true, true) => match sides.studio_matches_file {
+                    Some(true) => Action(InSync, None),
+                    _ => unless_studio_kept_its_base(ToStudio, BothChanged),
+                },
             }
         }
         (Some(_), Some(_), None) => compare(BothChanged),
@@ -155,7 +216,7 @@ pub fn decide(sides: AssetSides) -> Decision {
             if studio == base.studio || base.is_older_studio_version(&studio) {
                 Action(DeleteStudio, None)
             } else {
-                needs_studio_contents(Conflict, Some(DeletedOnDisk))
+                unless_studio_kept_its_base(DeleteStudio, DeletedOnDisk)
             }
         }
         (Some(_), None, None) if sides.place_saved => needs_studio_contents(ToFs, None),
@@ -200,6 +261,8 @@ mod test {
         AssetSides {
             studio,
             studio_matches_file: studio_canonical.map(|canonical| Some(canonical) == fs),
+            studio_matches_base: false,
+            file_lacks_properties: false,
             fs,
             base,
             place_saved: true,
@@ -209,6 +272,24 @@ mod test {
     fn unsaved(sides: AssetSides<'_>) -> AssetSides<'_> {
         AssetSides {
             place_saved: false,
+            ..sides
+        }
+    }
+
+    /// Studio's contents are still what it last synced, though they hash
+    /// differently.
+    fn kept_base(sides: AssetSides<'_>) -> AssetSides<'_> {
+        AssetSides {
+            studio_matches_base: true,
+            ..sides
+        }
+    }
+
+    /// Studio's contents are the file's, with properties the file lacks.
+    fn newer_studio(sides: AssetSides<'_>) -> AssetSides<'_> {
+        AssetSides {
+            studio_matches_file: Some(true),
+            file_lacks_properties: true,
             ..sides
         }
     }
@@ -280,6 +361,109 @@ mod test {
         assert_eq!(
             decide(sides(Some(C), Some(A), Some(C), Some(&base_bb))),
             because(PlanAction::Conflict, PlanReason::BothChanged)
+        );
+    }
+
+    #[test]
+    fn file_changes_win_when_studio_only_serializes_differently() {
+        let base = base(B, A);
+
+        // Studio's hash changed and so did the file, but Studio still has
+        // what it last synced, so there's nothing to ask about. That can only
+        // be told once Studio's contents were uploaded.
+        assert_eq!(
+            decide(sides(Some(C), None, Some(D), Some(&base))),
+            Decision::NeedsUpload
+        );
+        assert_eq!(
+            decide(kept_base(sides(Some(C), Some(C), Some(D), Some(&base)))),
+            action(PlanAction::ToStudio)
+        );
+        assert_eq!(
+            decide(unsaved(kept_base(sides(
+                Some(C),
+                Some(C),
+                Some(D),
+                Some(&base)
+            )))),
+            action(PlanAction::ToStudio)
+        );
+
+        // The same goes for a file that was deleted.
+        assert_eq!(
+            decide(kept_base(sides(Some(C), None, None, Some(&base)))),
+            Decision::NeedsUpload
+        );
+        assert_eq!(
+            decide(kept_base(sides(Some(C), Some(C), None, Some(&base)))),
+            action(PlanAction::DeleteStudio)
+        );
+
+        // If the file didn't change either, neither side did, even though
+        // Studio's contents aren't what the file holds. Studio saves
+        // properties that files from older versions of it don't have.
+        assert_eq!(
+            decide(kept_base(sides(Some(C), None, Some(B), Some(&base)))),
+            Decision::NeedsUpload
+        );
+        assert_eq!(
+            decide(kept_base(sides(Some(C), Some(C), Some(B), Some(&base)))),
+            action(PlanAction::InSync)
+        );
+        assert_eq!(
+            decide(unsaved(kept_base(sides(
+                Some(C),
+                Some(C),
+                Some(B),
+                Some(&base)
+            )))),
+            action(PlanAction::InSync)
+        );
+
+        // Studio's own changes are never dropped because of it.
+        assert_eq!(
+            decide(sides(Some(C), Some(C), Some(B), Some(&base))),
+            action(PlanAction::ToFs)
+        );
+    }
+
+    #[test]
+    fn files_that_lack_properties_are_brought_up_to_date() {
+        let base = base(B, A);
+        let upgrade = because(PlanAction::ToFs, PlanReason::NewProperties);
+
+        // Neither side changed, Studio's hash changed because a Studio update
+        // started saving a property, or the place never synced before.
+        assert_eq!(
+            decide(newer_studio(sides(Some(A), Some(A), Some(B), Some(&base)))),
+            upgrade
+        );
+        assert_eq!(
+            decide(newer_studio(sides(Some(C), Some(C), Some(B), Some(&base)))),
+            upgrade
+        );
+        assert_eq!(
+            decide(unsaved(newer_studio(sides(
+                Some(C),
+                Some(C),
+                Some(B),
+                Some(&base)
+            )))),
+            upgrade
+        );
+        assert_eq!(
+            decide(newer_studio(sides(Some(C), Some(C), Some(B), None))),
+            upgrade
+        );
+
+        // A file that changed is applied to Studio first. It's brought up to
+        // date once Studio has it.
+        assert_eq!(
+            decide(AssetSides {
+                file_lacks_properties: true,
+                ..sides(Some(A), None, Some(C), Some(&base))
+            }),
+            action(PlanAction::ToStudio)
         );
     }
 

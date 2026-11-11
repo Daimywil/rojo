@@ -119,6 +119,12 @@ local function describe(summary): string
 	if summary.deleteStudio > 0 then
 		table.insert(other, plural(summary.deleteStudio, "asset") .. " will be deleted from Studio")
 	end
+	if (summary.upgrades or 0) > 0 then
+		table.insert(
+			other,
+			plural(summary.upgrades, "file") .. " will be updated with properties that this version of Studio saves"
+		)
+	end
 
 	if #other > 0 then
 		table.insert(lines, "")

@@ -834,14 +834,26 @@ fn handle_assets_plan(
         .map(|asset| Ok((asset.path, parse_hash(&asset.hash)?)))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let plan = session.asset_store().plan(
-        &request.client_id,
-        &request.place_id,
-        request.session.as_deref(),
-        request.container,
-        &assets,
-        &request.skipped,
-    )?;
+    let store = session.asset_store();
+    let plan = if request.upgrade_files {
+        store.plan(
+            &request.client_id,
+            &request.place_id,
+            request.session.as_deref(),
+            request.container,
+            &assets,
+            &request.skipped,
+        )
+    } else {
+        store.plan_without_upgrades(
+            &request.client_id,
+            &request.place_id,
+            request.session.as_deref(),
+            request.container,
+            &assets,
+            &request.skipped,
+        )
+    }?;
 
     Ok(AssetsPlanResponse {
         session_id: session.session_id(),
@@ -912,6 +924,7 @@ fn handle_assets_ack(
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     session.asset_store().ack(
+        request.client_id.as_deref(),
         &request.place_id,
         request.container,
         &applied,
@@ -985,9 +998,12 @@ fn handle_assets_read(
     session: &ServeSession,
     request: AssetsReadRequest,
 ) -> anyhow::Result<AssetsReadResponse> {
-    let files = session
+    let read = session
         .asset_store()
-        .read(request.container, &request.paths)?
+        .read(request.container, &request.paths)?;
+
+    let files = read
+        .files
         .into_iter()
         .map(|entry| AssetFile {
             path: entry.path,
@@ -999,6 +1015,7 @@ fn handle_assets_read(
     Ok(AssetsReadResponse {
         session_id: session.session_id(),
         files,
+        unreadable: read.unreadable,
     })
 }
 

@@ -11,6 +11,9 @@
 //!   file moves along with it, without anything about them changing.
 //! - Every instance has a `UniqueId`, which only identifies it, and which
 //!   Studio gives copies of an instance new values for.
+//! - Studio works some properties out from an instance's other properties
+//!   some time after loading it, like the `TexturePack` of a
+//!   `SurfaceAppearance`, and gives them a new value every time it does.
 //!
 //! - New versions of Studio start saving properties that older ones didn't,
 //!   like `InputSinkEnabled` of GUIs. Every asset with that kind of instance
@@ -20,8 +23,9 @@
 //! Treating any of that as an edit would rewrite files and ask the user about
 //! changes nobody made. So models are compared as trees of instances rather
 //! than as bytes: siblings may be in any order, floats may differ by rounding,
-//! and `UniqueId`s may differ. Properties that only one of them has can be
-//! left out too (see [`Properties`]). Everything else has to be identical,
+//! and `UniqueId`s and the properties Studio works out on its own may differ.
+//! Properties that only one of them has can be left out too (see
+//! [`Properties`]). Everything else has to be identical,
 //! including integers, rotation IDs, and the instances that references point
 //! to. Models with anything this doesn't know how to read, like a type of
 //! value that's new to it, are never the same.
@@ -53,6 +57,18 @@ const MAX_DEPTH: usize = 512;
 /// other, and this keeps that from taking forever. Models that need more tries
 /// count as different.
 const TRIES_PER_INSTANCE: usize = 16;
+
+/// Properties that Studio works out from an instance's other properties and
+/// saves along with them. A `SurfaceAppearance` or `MaterialVariant` gets its
+/// textures packed into one asset some time after it's loaded, and gets a new
+/// ID for it whenever Studio packs them again, without anyone changing
+/// anything. Loading a file makes Studio do just that, so treating these as
+/// edits would rewrite every file with textures right after it was loaded.
+const DERIVED_PROPERTIES: &[&[u8]] = &[
+    b"TexturePack",
+    b"TexturePackContent",
+    b"TexturePackMetadata",
+];
 
 // The value types of the binary format.
 const STRING: u8 = 0x01;
@@ -111,10 +127,64 @@ pub enum Properties {
     Shared,
 }
 
+/// How the properties an asset file has relate to the ones Studio's version
+/// of it has, apart from the ones Studio works out on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertySets {
+    /// Both have the same properties.
+    Same,
+
+    /// Studio's version has every property the file has, and some the file
+    /// doesn't. That's what a file from an older version of Studio looks
+    /// like to a newer one, which makes it safe to bring the file up to date:
+    /// the Studio that saved it has nothing to add to it in turn.
+    StudioHasMore,
+
+    /// The file has properties that Studio's version doesn't, like one from
+    /// a newer version of Studio than this one.
+    Other,
+}
+
+fn property_sets(file: &Model<'_>, studio: &Model<'_>) -> PropertySets {
+    let in_studio: HashMap<&[u8], HashSet<&[u8]>> = studio
+        .classes
+        .iter()
+        .map(|class| {
+            let names = class.columns.iter().map(|column| column.name).collect();
+            (class.name, names)
+        })
+        .collect();
+
+    let mut studio_has_more = false;
+    for class in &file.classes {
+        // A class only one of them has makes them different either way.
+        let Some(studio_names) = in_studio.get(class.name) else {
+            continue;
+        };
+
+        let file_names: HashSet<&[u8]> = class.columns.iter().map(|column| column.name).collect();
+        if !file_names.is_subset(studio_names) {
+            return PropertySets::Other;
+        }
+        studio_has_more |= file_names.len() < studio_names.len();
+    }
+
+    if studio_has_more {
+        PropertySets::StudioHasMore
+    } else {
+        PropertySets::Same
+    }
+}
+
 /// Checks whether an asset file and Studio's version of it hold the same
 /// instances, apart from the differences Studio makes on its own (see the
-/// module's documentation).
-pub fn compare(file: &[u8], studio: &[u8], properties: Properties) -> Result<(), Difference> {
+/// module's documentation). If they do, returns how the properties they have
+/// relate, which can only differ when comparing [`Properties::Shared`].
+pub fn compare(
+    file: &[u8],
+    studio: &[u8],
+    properties: Properties,
+) -> Result<PropertySets, Difference> {
     let file = uncompressed(file).map_err(|err| Difference(format!("the file {err}")))?;
     let studio =
         uncompressed(studio).map_err(|err| Difference(format!("Studio's version {err}")))?;
@@ -122,6 +192,9 @@ pub fn compare(file: &[u8], studio: &[u8], properties: Properties) -> Result<(),
     let mut studio =
         Model::parse(&studio).map_err(|err| Difference(format!("Studio's version {err}")))?;
 
+    file.drop_derived_properties();
+    studio.drop_derived_properties();
+    let property_sets = property_sets(&file, &studio);
     if properties == Properties::Shared {
         keep_shared_properties(&mut file, &mut studio);
     }
@@ -148,7 +221,7 @@ pub fn compare(file: &[u8], studio: &[u8], properties: Properties) -> Result<(),
 
     let mut matcher = Matcher::new(&file, &studio);
     if matcher.match_children(&file.roots, &studio.roots) && matcher.references_match() {
-        return Ok(());
+        return Ok(property_sets);
     }
 
     Err(Difference(if matcher.tries == 0 {
@@ -156,6 +229,23 @@ pub fn compare(file: &[u8], studio: &[u8], properties: Properties) -> Result<(),
     } else {
         explain(&file, &studio)
     }))
+}
+
+/// Hashes everything about a model that [`compare`] looks at. Two models with
+/// the same hash are the same to `compare`, whatever order their siblings are
+/// in and whatever their `UniqueId`s and the properties Studio works out on
+/// its own are.
+///
+/// Unlike `compare`, this can't allow for rounding, so models that only
+/// differ in the last bit of a float hash differently. A different hash
+/// therefore doesn't mean that anything changed, but the same hash always
+/// means that nothing did. That makes it possible to tell that Studio still
+/// has what it last synced without keeping a copy of that around.
+pub fn stable_hash(contents: &[u8]) -> Result<[u8; 16], String> {
+    let contents = uncompressed(contents)?;
+    let mut model = Model::parse(&contents)?;
+    model.drop_derived_properties();
+    model.stable_hash()
 }
 
 /// Leaves out every property that the same class doesn't have in the other
@@ -401,6 +491,13 @@ fn skip_rotation(reader: &mut Reader) -> Result<(), String> {
     Ok(())
 }
 
+/// Hashes bytes along with how many there are, so that two runs of bytes
+/// hashed after each other can't be mistaken for two other ones.
+fn hash_bytes_into(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 impl<'a> Model<'a> {
     fn parse(contents: &'a [u8]) -> Result<Self, String> {
         let chunks = rbxm::chunks(contents).map_err(|err| format!("can't be read: {err}"))?;
@@ -602,12 +699,20 @@ impl<'a> Model<'a> {
         reader.finish()
     }
 
-    /// Computes the fingerprint of every instance, and checks that every
-    /// instance descends from a root, which instances parented to each other
-    /// in a loop don't.
-    fn fingerprint_all(&mut self) -> Result<(), String> {
-        // Every instance comes after its parent in this order, so going
-        // through it backwards gets to children before their parents.
+    /// Leaves out the properties Studio works out on its own (see
+    /// [`DERIVED_PROPERTIES`]).
+    fn drop_derived_properties(&mut self) {
+        for class in &mut self.classes {
+            class
+                .columns
+                .retain(|column| !DERIVED_PROPERTIES.contains(&column.name));
+        }
+    }
+
+    /// Lists every instance after its parent, and checks that every instance
+    /// descends from a root, which instances parented to each other in a loop
+    /// don't.
+    fn hierarchy_order(&self) -> Result<Vec<usize>, String> {
         let mut order = Vec::with_capacity(self.instances.len());
         let mut to_visit: Vec<(usize, usize)> =
             self.roots.iter().rev().map(|&root| (root, 1)).collect();
@@ -627,6 +732,141 @@ impl<'a> Model<'a> {
         if order.len() != self.instances.len() {
             return Err("has instances that are parented to each other".to_owned());
         }
+
+        Ok(order)
+    }
+
+    /// See [`stable_hash`].
+    fn stable_hash(&self) -> Result<[u8; 16], String> {
+        type Digest = [u8; 32];
+
+        let order = self.hierarchy_order()?;
+        let count = self.instances.len();
+
+        // What an instance is on its own: its class and every value of its
+        // properties, apart from which instances its references point to.
+        let mut own: Vec<Digest> = vec![[0; 32]; count];
+        let mut fields = Vec::new();
+        for (index, instance) in self.instances.iter().enumerate() {
+            let class = &self.classes[instance.class];
+
+            let mut hasher = blake3::Hasher::new();
+            hash_bytes_into(&mut hasher, class.name);
+            hasher.update(&[u8::from(instance.service)]);
+
+            for column in &class.columns {
+                hash_bytes_into(&mut hasher, column.name);
+                hasher.update(&[column.value_type]);
+
+                fields.clear();
+                column.fields(instance.position, &self.shared_strings, &mut fields);
+                hasher.update(&(fields.len() as u64).to_le_bytes());
+                for field in &fields {
+                    match field {
+                        Field::Bytes(bytes) => {
+                            hasher.update(&[0]);
+                            hash_bytes_into(&mut hasher, bytes);
+                        }
+                        Field::Small(bytes) => {
+                            hasher.update(&[1]);
+                            hasher.update(bytes);
+                        }
+                        Field::F32(value) => {
+                            hasher.update(&[2]);
+                            hasher.update(&value.to_bits().to_le_bytes());
+                        }
+                        Field::F64(value) => {
+                            hasher.update(&[3]);
+                            hasher.update(&value.to_bits().to_le_bytes());
+                        }
+                        Field::Ref(target) => {
+                            hasher.update(&[4, u8::from(target.is_some())]);
+                        }
+                    }
+                }
+            }
+
+            own[index] = *hasher.finalize().as_bytes();
+        }
+
+        // Where an instance is: what it and each of its ancestors are. This is
+        // what stands for an instance that a reference points to, since
+        // nothing else about it stays the same when siblings change order.
+        let mut parents: Vec<Option<usize>> = vec![None; count];
+        for (index, instance) in self.instances.iter().enumerate() {
+            for &child in &instance.children {
+                parents[child] = Some(index);
+            }
+        }
+        let mut place: Vec<Digest> = vec![[0; 32]; count];
+        for &index in &order {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&own[index]);
+            if let Some(parent) = parents[index] {
+                hasher.update(&place[parent]);
+            }
+            place[index] = *hasher.finalize().as_bytes();
+        }
+
+        // An instance with everything below it. Children come before their
+        // parents when going through the order backwards.
+        let mut whole: Vec<Digest> = vec![[0; 32]; count];
+        let mut children = Vec::new();
+        for &index in order.iter().rev() {
+            let instance = &self.instances[index];
+            let class = &self.classes[instance.class];
+
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&own[index]);
+
+            for column in class.columns.iter().filter(|column| column.has_refs()) {
+                fields.clear();
+                column.fields(instance.position, &self.shared_strings, &mut fields);
+                for field in &fields {
+                    if let Field::Ref(Some(target)) = field {
+                        hasher.update(&place[*target]);
+                    }
+                }
+            }
+
+            children.clear();
+            children.extend(instance.children.iter().map(|&child| whole[child]));
+            // Siblings may be in any order.
+            children.sort_unstable();
+            hasher.update(&(children.len() as u64).to_le_bytes());
+            for child in &children {
+                hasher.update(child);
+            }
+
+            whole[index] = *hasher.finalize().as_bytes();
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hash_bytes_into(&mut hasher, self.header);
+        hasher.update(&(self.metadata.len() as u64).to_le_bytes());
+        for (key, value) in &self.metadata {
+            hash_bytes_into(&mut hasher, key);
+            hash_bytes_into(&mut hasher, value);
+        }
+        hash_bytes_into(&mut hasher, self.end);
+        hash_bytes_into(&mut hasher, self.trailing);
+
+        let mut roots: Vec<Digest> = self.roots.iter().map(|&root| whole[root]).collect();
+        roots.sort_unstable();
+        for root in &roots {
+            hasher.update(root);
+        }
+
+        Ok(hasher.finalize().as_bytes()[..16].try_into().unwrap())
+    }
+
+    /// Computes the fingerprint of every instance, and checks that every
+    /// instance descends from a root, which instances parented to each other
+    /// in a loop don't.
+    fn fingerprint_all(&mut self) -> Result<(), String> {
+        // Every instance comes after its parent in this order, so going
+        // through it backwards gets to children before their parents.
+        let order = self.hierarchy_order()?;
 
         let mut fields = Vec::new();
         let mut child_fingerprints = Vec::new();
@@ -1813,6 +2053,141 @@ mod test {
         assert!(!same(&a, &model(vec![])));
     }
 
+    /// A part whose surface has the given color map, with its textures
+    /// packed into the given asset, if Studio got around to that yet.
+    ///
+    /// Studio saves which asset that is as a string on the surface. rbx_binary
+    /// saves that property as another one, so it's put on the part here,
+    /// which rbx_binary doesn't know to have it and saves as it is.
+    fn textured(color_map: &str, texture_pack: Option<&str>) -> Vec<u8> {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+
+        let mut part = InstanceBuilder::new("Part").with_name("Wall");
+        if let Some(texture_pack) = texture_pack {
+            part = part
+                .with_property("TexturePack", texture_pack)
+                .with_property("TexturePackMetadata", "packed");
+        }
+        let part = dom.insert(dom.root_ref(), part);
+        dom.insert(
+            part,
+            InstanceBuilder::new("SurfaceAppearance")
+                .with_property("ColorMap", Content::from_uri(color_map)),
+        );
+
+        serialize(&dom, part)
+    }
+
+    #[test]
+    fn properties_studio_works_out_on_its_own_are_ignored() {
+        let packed = textured("rbxassetid://1", Some("rbxassetid://100"));
+        let repacked = textured("rbxassetid://1", Some("rbxassetid://200"));
+        assert_ne!(
+            rbxm::canonicalize(&packed).unwrap(),
+            rbxm::canonicalize(&repacked).unwrap()
+        );
+        assert!(same(&packed, &repacked));
+
+        // Studio only packs textures some time after loading them, so one
+        // side may not have them packed at all.
+        let unpacked = textured("rbxassetid://1", None);
+        assert!(same(&packed, &unpacked));
+        assert!(same(&unpacked, &packed));
+
+        // The textures that are packed are still compared.
+        let other_texture = textured("rbxassetid://2", Some("rbxassetid://100"));
+        assert!(!same(&packed, &other_texture));
+    }
+
+    #[test]
+    fn stable_hashes_ignore_what_studio_changes_on_its_own() {
+        let hash = |model: &[u8]| stable_hash(model).unwrap();
+
+        // How chunks are compressed.
+        let tree = parts(&[("Trunk", 0.0), ("Branch", 1.0)]);
+        assert_ne!(tree, rbxm::canonicalize(&tree).unwrap());
+        assert_eq!(hash(&tree), hash(&rbxm::canonicalize(&tree).unwrap()));
+
+        // The order of siblings, and which referents instances get with it.
+        assert_eq!(
+            hash(&tree),
+            hash(&parts(&[("Branch", 1.0), ("Trunk", 0.0)]))
+        );
+        assert_eq!(
+            hash(&welded(["Handle", "Blade", "Guard"], "Blade")),
+            hash(&welded(["Guard", "Blade", "Handle"], "Blade"))
+        );
+
+        // UniqueIds.
+        let with_id = |random: i64| model(vec![("UniqueId", UniqueId::new(1, 2, random).into())]);
+        assert_eq!(hash(&with_id(12345)), hash(&with_id(67890)));
+
+        // Which asset textures are packed into.
+        assert_eq!(
+            hash(&textured("rbxassetid://1", Some("rbxassetid://100"))),
+            hash(&textured("rbxassetid://1", Some("rbxassetid://200")))
+        );
+        assert_eq!(
+            hash(&textured("rbxassetid://1", Some("rbxassetid://100"))),
+            hash(&textured("rbxassetid://1", None))
+        );
+    }
+
+    #[test]
+    fn stable_hashes_change_with_everything_else() {
+        let hash = |model: &[u8]| stable_hash(model).unwrap();
+
+        // A value, a name, and where an instance is.
+        let a = model(vec![("Transparency", 0.25f32.into())]);
+        assert_ne!(
+            hash(&a),
+            hash(&model(vec![("Transparency", 0.5f32.into())]))
+        );
+        assert_ne!(
+            hash(&parts(&[("Trunk", 0.0), ("Branch", 1.0)])),
+            hash(&parts(&[("Trunk", 0.0), ("Twig", 1.0)]))
+        );
+        assert_ne!(
+            hash(&parts(&[("Trunk", 0.0), ("Branch", 1.0)])),
+            hash(&parts(&[("Trunk", 1.0), ("Branch", 0.0)]))
+        );
+        assert_ne!(
+            hash(&parts(&[("Trunk", 0.0), ("Branch", 1.0)])),
+            hash(&parts(&[("Trunk", 0.0)]))
+        );
+
+        // Which instance a reference points to.
+        assert_ne!(
+            hash(&welded(["Handle", "Blade", "Guard"], "Blade")),
+            hash(&welded(["Handle", "Blade", "Guard"], "Guard"))
+        );
+
+        // The textures of a surface.
+        assert_ne!(
+            hash(&textured("rbxassetid://1", Some("rbxassetid://100"))),
+            hash(&textured("rbxassetid://2", Some("rbxassetid://100")))
+        );
+
+        // Rounding, which is what comparing two models allows for and a hash
+        // can't. The hash only has to be the same when nothing changed.
+        let rounded = model(vec![("Transparency", bump(0.25).into())]);
+        assert!(same(&a, &rounded));
+        assert_ne!(hash(&a), hash(&rounded));
+    }
+
+    #[test]
+    fn models_that_cannot_be_compared_have_no_stable_hash() {
+        assert!(stable_hash(b"not a model").is_err());
+
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.insert(dom.root_ref(), InstanceBuilder::new("Folder"));
+        let mut parent = root;
+        for _ in 1..MAX_DEPTH * 4 {
+            parent = dom.insert(parent, InstanceBuilder::new("Folder"));
+        }
+        assert!(stable_hash(&serialize(&dom, root)).is_err());
+    }
+
     #[test]
     fn deeply_nested_models_are_compared_safely() {
         let chain = |depth: usize| {
@@ -1874,9 +2249,43 @@ mod test {
                 .to_string(),
             "Arm.Palm.PropertyFromNewerStudio is only in Studio"
         );
-        assert!(compare(&old, &new, Properties::Shared).is_ok());
-        // A property only the file has, like one Studio stopped saving.
-        assert!(compare(&new, &old, Properties::Shared).is_ok());
+        // That's a file that can be brought up to date.
+        assert_eq!(
+            compare(&old, &new, Properties::Shared).unwrap(),
+            PropertySets::StudioHasMore
+        );
+        // A property only the file has, like one Studio stopped saving, or
+        // one from a newer version of Studio than this one. Writing Studio's
+        // version would take it away again.
+        assert_eq!(
+            compare(&new, &old, Properties::Shared).unwrap(),
+            PropertySets::Other
+        );
+        assert_eq!(
+            compare(&old, &old.clone(), Properties::Shared).unwrap(),
+            PropertySets::Same
+        );
+
+        // Each having a property the other doesn't isn't one being newer.
+        let sideways = model(vec![
+            ("Transparency", 0.25f32.into()),
+            ("AnotherProperty", false.into()),
+        ]);
+        assert_eq!(
+            compare(&new, &sideways, Properties::Shared).unwrap(),
+            PropertySets::Other
+        );
+
+        // Properties Studio works out on its own don't count as new.
+        assert_eq!(
+            compare(
+                &textured("rbxassetid://1", None),
+                &textured("rbxassetid://1", Some("rbxassetid://100")),
+                Properties::Shared
+            )
+            .unwrap(),
+            PropertySets::Same
+        );
 
         // The properties both have still have to be the same.
         let changed = model(vec![

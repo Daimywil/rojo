@@ -250,6 +250,17 @@ function SettingsPage:render()
 				layoutOrder = layoutIncrement(),
 			}),
 
+			UpgradeAssetFiles = e(Setting, {
+				id = "upgradeAssetFiles",
+				name = "Update Asset Files",
+				description = "When connecting, rewrite asset files that lack properties this version of Studio saves, "
+					.. "like files from before a Studio update. Otherwise they only change when their asset is edited",
+				locked = self.props.syncActive,
+				lockedTooltip = "(Cannot change while currently syncing. Disconnect first.)",
+				transparency = self.props.transparency,
+				layoutOrder = layoutIncrement(),
+			}),
+
 			LogLevel = e(Setting, {
 				id = "logLevel",
 				name = "Log Level",

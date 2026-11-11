@@ -50,7 +50,14 @@ local FILE_CHANGE_QUIET_PERIOD = 0.1
 local MAX_FILE_CHANGE_DELAY = 3
 local UPLOAD_BATCH_BYTES = 8 * 1024 * 1024
 local READ_BATCH_SIZE = 200
+-- How many assets that were applied from files are serialized at once to tell
+-- the server what Studio made of them, which keeps only that many in memory.
+local PLACED_BATCH_SIZE = 200
 local RETRY_DELAY = 3
+-- How often applying a changed file is tried again before giving up on it.
+-- Files can only not be read while another program is still writing them,
+-- which rarely takes more than a moment.
+local MAX_FILE_RETRIES = 10
 -- How long work spread over frames may run before Studio gets to draw one.
 local FRAME_WORK_BUDGET = 0.008
 -- How often the count of a step of the initial sync is updated at most, since
@@ -127,6 +134,9 @@ export type Summary = {
 	toStudio: number,
 	deleteFs: number,
 	deleteStudio: number,
+	-- How many files are written only because they lack properties that
+	-- Studio saves, like files from before a Studio update.
+	upgrades: number,
 	conflicts: { Conflict },
 }
 
@@ -139,6 +149,9 @@ export type Summary = {
 	  on start. Yields until they do, and returns "KeepStudio", "KeepFiles",
 	  or "Abort".
 	- notify: called with short messages worth showing to the user.
+	- upgradeFiles: whether files that lack properties Studio saves, like files
+	  from before a Studio update, are written when starting to bring them up
+	  to date. Defaults to true.
 - progress: called with what the initial sync is doing, as plain text, to
   show while the session starts. It can take minutes when a place doesn't
   have the assets yet.
@@ -150,6 +163,7 @@ function AssetSync.new(options)
 		__confirm = options.confirm,
 		__notify = options.notify or function() end,
 		__onProgress = options.progress or function() end,
+		__upgradeFiles = options.upgradeFiles ~= false,
 		__showingProgress = false,
 		__progressShownAt = -math.huge,
 
@@ -164,6 +178,10 @@ function AssetSync.new(options)
 		__connections = {},
 		__selectionConnections = {},
 		__fsChanges = {},
+		-- Changed files that couldn't be read yet, and when to try them again.
+		__unreadable = {},
+		-- How often applying file changes failed in a row.
+		__fsFailures = 0,
 		__firstFsChangeAt = 0,
 		__lastFsChangeAt = 0,
 		__running = false,
@@ -408,9 +426,15 @@ end
 
 --[[
 	Uploads the serialized assets with the given paths so the server can
-	compare or write them.
+	compare or write them. Calls `onProgress` with how many are uploaded, or
+	shows that as comparing assets if it isn't given.
 ]]
-function AssetSync:__upload(container, paths: { string }, serialized: { [string]: serializer.Result })
+function AssetSync:__upload(
+	container,
+	paths: { string },
+	serialized: { [string]: serializer.Result },
+	onProgress: ((number) -> ())?
+)
 	local batch = {}
 	local batchBytes = 0
 	local uploaded = 0
@@ -429,7 +453,11 @@ function AssetSync:__upload(container, paths: { string }, serialized: { [string]
 			:expect()
 
 		uploaded += #batch
-		self:__progress(container, "Uploading assets to compare them", uploaded, #paths)
+		if onProgress ~= nil then
+			onProgress(uploaded)
+		else
+			self:__progress(container, "Uploading assets to compare them", uploaded, #paths)
+		end
 
 		batch = {}
 		batchBytes = 0
@@ -673,6 +701,7 @@ function AssetSync:__initialSync(container)
 		container = container.id,
 		assets = hashes(),
 		skipped = skipped,
+		upgradeFiles = self.__upgradeFiles,
 	}
 
 	local plan = self.__apiContext:assetsPlan(planRequest):expect()
@@ -696,10 +725,14 @@ function AssetSync:__initialSync(container)
 	end
 
 	local toFs, deleteFs, toStudio, deleteStudio, conflicts = {}, {}, {}, {}, {}
+	-- Assets nobody changed, whose files are written only because they lack
+	-- properties that Studio saves. A Studio update that starts saving a
+	-- property does that to every file with that kind of instance at once.
+	local upgrades = {}
 	local restored = 0
 	for _, entry in plan.actions do
 		if entry.action == "toFs" then
-			table.insert(toFs, entry.path)
+			table.insert(if entry.reason == "newProperties" then upgrades else toFs, entry.path)
 		elseif entry.action == "deleteFs" then
 			table.insert(deleteFs, entry.path)
 		elseif entry.action == "toStudio" then
@@ -731,6 +764,7 @@ function AssetSync:__initialSync(container)
 			toStudio = #toStudio,
 			deleteFs = #deleteFs,
 			deleteStudio = #deleteStudio,
+			upgrades = #upgrades,
 			conflicts = conflicts,
 		})
 
@@ -758,9 +792,18 @@ function AssetSync:__initialSync(container)
 			for _, conflict in conflicts do
 				table.insert(toStudio, conflict.path)
 			end
+
+			-- Studio already has what these files hold, so there's nothing
+			-- to replace. They're just not written this time.
+			table.clear(upgrades)
 		else
 			error("Asset sync was aborted")
 		end
+	end
+
+	local written = #toFs
+	for _, path in upgrades do
+		table.insert(toFs, path)
 	end
 
 	if #toFs > 0 or #deleteFs > 0 then
@@ -798,8 +841,25 @@ function AssetSync:__initialSync(container)
 		end
 	end
 
+	-- Assets that were serialized again to upload them may have changed since
+	-- their group was hashed, in which case that hash doesn't stand for what
+	-- they are now.
+	for path, result in serialized do
+		local instance = layout.units[path]
+		local grouped = if instance ~= nil then results[instance] else nil
+		if grouped ~= nil and grouped ~= result then
+			if grouped.hash ~= result.hash then
+				replaced[instance] = true
+			end
+			results[instance] = result
+		end
+	end
+
 	if #toStudio > 0 or #deleteStudio > 0 then
-		self:__applyFileChanges(container, toStudio, deleteStudio)
+		local _, _, unreadable = self:__applyFileChanges(container, toStudio, deleteStudio)
+		-- These are applied once they can be read, like files that change
+		-- later on.
+		self:__queueUnreadable(container, unreadable)
 	end
 
 	self:__recordGroups(container, groups, results, replaced)
@@ -809,11 +869,22 @@ function AssetSync:__initialSync(container)
 		count,
 		container.path,
 		string.format("%.1f", os.clock() - started),
-		#toFs,
+		written,
 		#deleteFs,
 		#toStudio,
 		#deleteStudio
 	)
+
+	if #upgrades > 0 then
+		local message = string.format(
+			"Updated %d asset files in %s with properties that this version of Studio saves. "
+				.. "Nobody changed these assets, so the files are best committed on their own.",
+			#upgrades,
+			container.path
+		)
+		Log.info(message)
+		self.__notify(message)
+	end
 
 	if restored > 0 then
 		local message = string.format(
@@ -825,13 +896,13 @@ function AssetSync:__initialSync(container)
 		self.__notify(message)
 	end
 
-	local changed = #toFs + #deleteFs + #toStudio + #deleteStudio
+	local changed = written + #deleteFs + #toStudio + #deleteStudio
 	if changed > 0 then
 		self.__notify(
 			string.format(
 				"Synced assets in %s: %d changed on disk, %d changed in Studio.",
 				container.path,
-				#toFs + #deleteFs,
+				written + #deleteFs,
 				#toStudio + #deleteStudio
 			)
 		)
@@ -973,9 +1044,14 @@ end
 --[[
 	Applies files to Studio, and deletes the assets whose files were deleted.
 	Paths in `changed` whose files no longer exist are deleted too.
+
+	Returns how many assets were applied, how many were deleted, and the paths
+	in `changed` whose files exist but can't be read right now. Those are left
+	as they are in Studio.
 ]]
 function AssetSync:__applyFileChanges(container, changed: { string }, removed: { string })
 	local files = {}
+	local unreadable = {}
 	for start = 1, #changed, READ_BATCH_SIZE do
 		self:__progress(container, "Reading files", start - 1, #changed)
 
@@ -990,11 +1066,20 @@ function AssetSync:__applyFileChanges(container, changed: { string }, removed: {
 		for _, file in response.files do
 			table.insert(files, file)
 		end
+		-- Servers that don't report these fail the whole request instead.
+		for _, path in response.unreadable or {} do
+			table.insert(unreadable, path)
+		end
 	end
 
+	-- A file that can't be read isn't gone, so its asset must not be deleted
+	-- like the ones whose files are.
 	local readPaths = {}
 	for _, file in files do
 		readPaths[file.path] = true
+	end
+	for _, path in unreadable do
+		readPaths[path] = true
 	end
 
 	-- New instances are added as the last child, so adding them in suffix order
@@ -1122,32 +1207,53 @@ function AssetSync:__applyFileChanges(container, changed: { string }, removed: {
 
 	-- Remember what Studio serializes the applied assets to, so that we know
 	-- they're unchanged until someone edits them.
-	local instances = {}
-	for index, entry in applied do
-		instances[index] = entry.instance
-	end
-	local results = serializer.serializeMany(instances, false, function(finished)
-		self:__progress(container, "Checking placed assets", finished, #instances)
-	end)
-
+	--
+	-- The server gets to see that too. Studio doesn't serialize an asset to
+	-- exactly what its file holds: it saves properties that files from older
+	-- versions of Studio don't have, and soon packs the asset's textures
+	-- again. Knowing what Studio made of a file is how the server tells such
+	-- changes from edits, instead of writing them to the file that was just
+	-- applied.
 	local acks = {}
-	for index, entry in applied do
-		local result = results[index]
-		local current = container.units[entry.path]
-		if result.hash ~= nil and current ~= nil and current.instance == entry.instance then
-			current.hash = result.hash
-			container.dirtyUnits[entry.instance] = nil
-			table.insert(acks, {
-				path = entry.path,
-				fsHash = entry.fsHash,
-				studioHash = buffer.fromstring(result.hash),
-			})
+	local checked = 0
+	for start = 1, #applied, PLACED_BATCH_SIZE do
+		local batch = table.move(applied, start, math.min(start + PLACED_BATCH_SIZE - 1, #applied), 1, {})
+		local instances = table.create(#batch)
+		for index, entry in batch do
+			instances[index] = entry.instance
 		end
+
+		local results = serializer.serializeMany(instances, true, function(finished)
+			self:__progress(container, "Checking placed assets", checked + finished, #applied)
+		end)
+		checked += #batch
+
+		local serialized, paths = {}, {}
+		for index, entry in batch do
+			local result = results[index]
+			local current = container.units[entry.path]
+			if result.hash ~= nil and current ~= nil and current.instance == entry.instance then
+				current.hash = result.hash
+				container.dirtyUnits[entry.instance] = nil
+
+				serialized[entry.path] = result
+				table.insert(paths, entry.path)
+				table.insert(acks, {
+					path = entry.path,
+					fsHash = entry.fsHash,
+					studioHash = buffer.fromstring(result.hash),
+				})
+			end
+		end
+
+		-- The count that's shown stays the one of the assets checked so far.
+		self:__upload(container, paths, serialized, function() end)
 	end
 
 	if #acks > 0 or #removedPaths > 0 then
 		self.__apiContext
 			:assetsAck({
+				clientId = self.__clientId,
 				placeId = self.__placeId,
 				container = container.id,
 				applied = acks,
@@ -1156,7 +1262,7 @@ function AssetSync:__applyFileChanges(container, changed: { string }, removed: {
 			:expect()
 	end
 
-	return #applied, #removedPaths
+	return #applied, #removedPaths, unreadable
 end
 
 --[[
@@ -1579,6 +1685,63 @@ function AssetSync:__fileChangesAreDue(now: number): boolean
 end
 
 --[[
+	Remembers files that changed but can't be read yet, so they're applied
+	once they can be. That's usually a moment later, when whatever is writing
+	them is done. `attempts` has how often each path was tried before, if it
+	was.
+]]
+function AssetSync:__queueUnreadable(container, paths: { string }, attempts: { [string]: number }?)
+	for _, path in paths do
+		local attempt = (if attempts ~= nil then attempts[path] or 0 else 0) + 1
+		if attempt > MAX_FILE_RETRIES then
+			Log.warn(
+				"Could not read the asset file {} in {}. Studio keeps the version it has until the file changes again.",
+				path,
+				container.path
+			)
+			continue
+		end
+
+		table.insert(self.__unreadable, {
+			container = container.id,
+			path = path,
+			attempts = attempt,
+			retryAt = os.clock() + RETRY_DELAY,
+		})
+	end
+end
+
+--[[
+	Queues the files that couldn't be read before and are due for another try,
+	as if they just changed.
+]]
+function AssetSync:__retryUnreadable(now: number)
+	if #self.__unreadable == 0 then
+		return
+	end
+
+	local waiting = {}
+	for _, entry in self.__unreadable do
+		if now < entry.retryAt then
+			table.insert(waiting, entry)
+			continue
+		end
+
+		if #self.__fsChanges == 0 then
+			self.__firstFsChangeAt = now
+		end
+		self.__lastFsChangeAt = now
+		table.insert(self.__fsChanges, {
+			container = entry.container,
+			path = entry.path,
+			removed = false,
+			attempts = entry.attempts,
+		})
+	end
+	self.__unreadable = waiting
+end
+
+--[[
 	Applies queued file changes to Studio.
 ]]
 function AssetSync:__processFileChanges()
@@ -1587,6 +1750,7 @@ function AssetSync:__processFileChanges()
 
 	-- Only the latest change to each path matters.
 	local latest = {}
+	local attempts = {}
 	for _, change in changes do
 		local container = self.__containerById[change.container]
 		if container == nil then
@@ -1595,32 +1759,78 @@ function AssetSync:__processFileChanges()
 
 		latest[container] = latest[container] or {}
 		latest[container][change.path] = change.removed
+		attempts[container] = attempts[container] or {}
+		attempts[container][change.path] = change.attempts
 	end
 
-	for container, paths in latest do
-		local changed, removed = {}, {}
-		for path, wasRemoved in paths do
-			if container.dirtyUnits[container.units[path] and container.units[path].instance] then
-				Log.warn("{} changed on disk while it had unsaved changes in Studio. Using the file's version.", path)
+	local finished = {}
+	local success, err = pcall(function()
+		for container, paths in latest do
+			local changed, removed = {}, {}
+			for path, wasRemoved in paths do
+				if container.dirtyUnits[container.units[path] and container.units[path].instance] then
+					Log.warn(
+						"{} changed on disk while it had unsaved changes in Studio. Using the file's version.",
+						path
+					)
+				end
+
+				if wasRemoved then
+					table.insert(removed, path)
+				else
+					table.insert(changed, path)
+				end
 			end
 
-			if wasRemoved then
-				table.insert(removed, path)
-			else
-				table.insert(changed, path)
+			local appliedCount, removedCount, unreadable = self:__applyFileChanges(container, changed, removed)
+			finished[container] = true
+			self:__queueUnreadable(container, unreadable, attempts[container])
+
+			if appliedCount + removedCount > 0 then
+				Log.info(
+					"Applied {} changed and {} deleted asset files to {}",
+					appliedCount,
+					removedCount,
+					container.instance:GetFullName()
+				)
 			end
 		end
+	end)
 
-		local appliedCount, removedCount = self:__applyFileChanges(container, changed, removed)
-		if appliedCount + removedCount > 0 then
-			Log.info(
-				"Applied {} changed and {} deleted asset files to {}",
-				appliedCount,
-				removedCount,
-				container.instance:GetFullName()
-			)
+	if success then
+		self.__fsFailures = 0
+		return
+	end
+
+	-- Changes that weren't applied are tried again. Forgetting them would
+	-- leave Studio with older versions than the files have, which the next
+	-- edit made in Studio would write over those files. They go ahead of
+	-- changes that arrived in the meantime, so that the latest change to a
+	-- path is still the one that counts.
+	local remaining = {}
+	for _, change in changes do
+		local container = self.__containerById[change.container]
+		if container ~= nil and not finished[container] then
+			table.insert(remaining, change)
 		end
 	end
+
+	self.__fsFailures += 1
+	if self.__fsFailures > MAX_FILE_RETRIES then
+		-- Something is wrong that waiting doesn't fix. Trying forever would
+		-- keep changes made in Studio from being written as well.
+		Log.warn(
+			"Giving up on applying {} changed asset files after {} tries. Reconnect to sync them.",
+			#remaining,
+			self.__fsFailures
+		)
+		self.__fsFailures = 0
+	else
+		table.move(self.__fsChanges, 1, #self.__fsChanges, #remaining + 1, remaining)
+		self.__fsChanges = remaining
+	end
+
+	error(err, 0)
 end
 
 --[[
@@ -1851,7 +2061,6 @@ function AssetSync:__reconcile(container)
 			removals[path] = true
 		end
 	end
-	table.clear(container.pendingRemovals)
 
 	local directoryMoves = if structureChanged
 		then self:__findDirectoryMoves(container, targetUnits, targetDirectories, moves)
@@ -1926,6 +2135,10 @@ function AssetSync:__reconcile(container)
 	end
 
 	-- Everything worked out, apart from the failures, so update what we know.
+	-- Files that still had to be deleted are only forgotten now: if the
+	-- request itself failed, nothing was deleted, and they have to be next
+	-- time.
+	table.clear(container.pendingRemovals)
 	for path in removals do
 		if failures[path] ~= nil then
 			container.pendingRemovals[path] = true
@@ -2091,6 +2304,26 @@ function AssetSync:__layoutSweepStep(interval: number)
 	end
 end
 
+--[[
+	Returns a container whose instance isn't in the game anymore, if there is
+	one.
+
+	Everything in such a container was removed along with it, which looks just
+	like every asset in it being deleted. Deleting a whole asset directory is
+	never what removing its instance means though: undoing brings the instance
+	back, and Rojo replaces instances itself when the project changes.
+]]
+function AssetSync:__removedContainer()
+	for _, container in self.__containers do
+		local checked, inGame = pcall(container.instance.IsDescendantOf, container.instance, game)
+		if not checked or not inGame then
+			return container
+		end
+	end
+
+	return nil
+end
+
 function AssetSync:__workerLoop()
 	local lastSweep = os.clock()
 
@@ -2098,7 +2331,22 @@ function AssetSync:__workerLoop()
 		local now = os.clock()
 		local success, err = true, nil
 
+		local removedContainer = self:__removedContainer()
+		if removedContainer ~= nil then
+			local message = string.format(
+				"Asset sync stopped: the instance that %s is synced into was removed. "
+					.. "No files were deleted. Reconnect to sync assets again.",
+				removedContainer.path
+			)
+			Log.warn(message)
+			self.__notify(message)
+			self:stop()
+			break
+		end
+
 		if now >= self.__retryAt then
+			self:__retryUnreadable(now)
+
 			if self:__fileChangesAreDue(now) then
 				success, err = pcall(self.__processFileChanges, self)
 			elseif #self.__fsChanges > 0 then
