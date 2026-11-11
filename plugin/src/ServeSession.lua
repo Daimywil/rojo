@@ -64,6 +64,9 @@ ServeSession.Status = Status
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
 	twoWaySync = t.boolean,
+	-- Lets the confirm callback reject the initial patch without two-way sync, for whoever is entitled to decide
+	-- that Studio wins whatever the setting says
+	allowReject = t.optional(t.boolean),
 })
 
 function ServeSession.new(options)
@@ -102,6 +105,7 @@ function ServeSession.new(options)
 		__status = Status.NotStarted,
 		__apiContext = options.apiContext,
 		__twoWaySync = options.twoWaySync,
+		__allowReject = options.allowReject == true,
 		__reconciler = reconciler,
 		__instanceMap = instanceMap,
 		__changeBatcher = changeBatcher,
@@ -552,7 +556,7 @@ function ServeSession:__initialSync(serverInfo)
 		if userDecision == "Abort" then
 			return Promise.reject("Aborted Rojo sync operation")
 		elseif userDecision == "Reject" then
-			if not self.__twoWaySync then
+			if not self.__twoWaySync and not self.__allowReject then
 				return Promise.reject("Cannot reject sync operation without two-way sync enabled")
 			end
 			-- The user wants their studio DOM to write back to their Rojo DOM

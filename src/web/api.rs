@@ -4,8 +4,10 @@
 use std::{collections::HashMap, fs, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
 use futures::{sink::SinkExt, stream::StreamExt};
-use hyper::{body, Body, Method, Request, Response, StatusCode};
-use hyper_tungstenite::{is_upgrade_request, tungstenite::Message, upgrade, HyperWebsocket};
+use hyper::{body, upgrade::Upgraded, Body, Method, Request, Response, StatusCode};
+use hyper_tungstenite::{
+    is_upgrade_request, tungstenite::Message, upgrade, HyperWebsocket, WebSocketStream,
+};
 use opener::OpenError;
 use rbx_dom_weak::{
     types::{Ref, Variant},
@@ -16,11 +18,13 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     assets::{AckEntry, AssetMessage, Group, Hash, WriteOp},
+    serve_events::DisconnectReason,
     serve_session::ServeSession,
     server_registry,
     session_id::SessionId,
     snapshot::{InstanceWithMeta, PatchSet, PatchUpdate},
     web::{
+        clients::{ClientConnection, ClientDetails},
         interface::{
             AssetContainer, AssetFile, AssetFileChange, AssetGroup, AssetPlanEntry, AssetSynced,
             AssetWriteFailure, AssetsAckRequest, AssetsApplyRequest, AssetsGroupsRequest,
@@ -29,11 +33,12 @@ use crate::{
             AssetsSessionRequest, AssetsSocketPacket, AssetsStageRequest, AssetsWriteRequest,
             AssetsWriteResponse, ErrorResponse, Instance, MessagesPacket, OpenResponse,
             ReadResponse, ServerInfoResponse, ServersResponse, SocketPacket, SocketPacketBody,
-            SocketPacketType, SubscribeMessage, WriteRequest, WriteResponse, PROTOCOL_VERSION,
-            SERVER_VERSION,
+            SocketPacketType, StatusResponse, SubscribeMessage, WriteRequest, WriteResponse,
+            PROTOCOL_VERSION, SERVER_VERSION,
         },
         origin::canonical,
-        util::{deserialize_msgpack, msgpack, msgpack_ok, serialize_msgpack},
+        util::{deserialize_msgpack, json, msgpack, msgpack_ok, serialize_msgpack},
+        ServerStatus,
     },
     web_api::{
         InstanceUpdate, RefPatchRequest, RefPatchResponse, SerializeRequest, SerializeResponse,
@@ -42,13 +47,15 @@ use crate::{
 
 pub async fn call(
     serve_session: Arc<ServeSession>,
+    status: Arc<ServerStatus>,
     remote_addr: SocketAddr,
     mut request: Request<Body>,
 ) -> Response<Body> {
-    let service = ApiService::new(serve_session, remote_addr);
+    let service = ApiService::new(serve_session, status, remote_addr);
 
     match (request.method(), request.uri().path()) {
         (&Method::GET, "/api/rojo") => service.handle_api_rojo().await,
+        (&Method::GET, "/api/status") => service.handle_api_status().await,
         (&Method::GET, "/api/servers") => handle_api_servers().await,
         (&Method::GET, path) if path.starts_with("/api/read/") => {
             service.handle_api_read(request).await
@@ -155,13 +162,19 @@ pub async fn handle_api_servers() -> Response<Body> {
 
 pub struct ApiService {
     serve_session: Arc<ServeSession>,
+    status: Arc<ServerStatus>,
     remote_addr: SocketAddr,
 }
 
 impl ApiService {
-    pub fn new(serve_session: Arc<ServeSession>, remote_addr: SocketAddr) -> Self {
+    pub fn new(
+        serve_session: Arc<ServeSession>,
+        status: Arc<ServerStatus>,
+        remote_addr: SocketAddr,
+    ) -> Self {
         ApiService {
             serve_session,
+            status,
             remote_addr,
         }
     }
@@ -184,8 +197,31 @@ impl ApiService {
         })
     }
 
+    /// Says what the server serves and which plugins are syncing with it, so
+    /// that a program that runs Rojo can pick up where it left off after
+    /// restarting itself.
+    async fn handle_api_status(&self) -> Response<Body> {
+        json(
+            StatusResponse {
+                session_id: self.serve_session.session_id(),
+                server_version: SERVER_VERSION.to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                project_name: self.serve_session.project_name().to_owned(),
+                port: self.status.address.port(),
+                address: self.status.address.ip(),
+                serve_place_ids: self.serve_session.sorted_serve_place_ids(),
+                started_at: self.status.started_at,
+                clients: self.status.clients.list(),
+            },
+            StatusCode::OK,
+        )
+    }
+
     /// Handle WebSocket upgrade for real-time message streaming
     async fn handle_api_socket(&self, request: &mut Request<Body>) -> Response<Body> {
+        // Plugins say which Studio they are in the query, which servers from
+        // before they did never looked at.
+        let details = ClientDetails::from_query(request.uri().query());
         let argument = &request.uri().path()["/api/socket/".len()..];
         let input_cursor: u32 = match argument.parse() {
             Ok(v) => v,
@@ -209,11 +245,24 @@ impl ApiService {
         };
 
         let serve_session = Arc::clone(&self.serve_session);
+        let status = Arc::clone(&self.status);
 
         // Spawn a task to handle the WebSocket connection
         tokio::spawn(async move {
+            let websocket = match websocket.await {
+                Ok(websocket) => websocket,
+                Err(e) => {
+                    log::error!("Error in websocket subscription: {}", e);
+                    return;
+                }
+            };
+
+            // The plugin counts as connected for exactly as long as this
+            // connection is open.
+            let client = status.clients.connect(details);
+
             if let Err(e) =
-                handle_websocket_subscription(serve_session, websocket, input_cursor).await
+                handle_websocket_subscription(serve_session, websocket, input_cursor, client).await
             {
                 log::error!("Error in websocket subscription: {}", e);
             }
@@ -687,11 +736,10 @@ fn pick_script_path(instance: InstanceWithMeta<'_>) -> Option<PathBuf> {
 /// Handle WebSocket connection for streaming subscription messages
 async fn handle_websocket_subscription(
     serve_session: Arc<ServeSession>,
-    websocket: HyperWebsocket,
+    mut websocket: WebSocketStream<Upgraded>,
     input_cursor: u32,
+    mut client: ClientConnection,
 ) -> anyhow::Result<()> {
-    let mut websocket = websocket.await?;
-
     let session_id = serve_session.session_id();
     let tree_handle = serve_session.tree_handle();
     let message_queue = serve_session.message_queue();
@@ -745,6 +793,7 @@ async fn handle_websocket_subscription(
                     Err(_) => {
                         // Message queue disconnected
                         log::debug!("Message queue disconnected; closing WebSocket subscription");
+                        client.set_reason(DisconnectReason::ServerShutdown);
                         let _ = websocket.send(Message::Close(None)).await;
                         break;
                     }
@@ -756,6 +805,7 @@ async fn handle_websocket_subscription(
                 match msg {
                     Some(Ok(Message::Close(_))) => {
                         log::debug!("WebSocket subscription closed by client");
+                        client.set_reason(DisconnectReason::ClosedByClient);
                         break;
                     }
                     Some(Ok(Message::Ping(data))) => {

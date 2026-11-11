@@ -7,6 +7,8 @@ local Roact = require(Packages.Roact)
 local Theme = require(Plugin.App.Theme)
 
 local Spinner = require(Plugin.App.Components.Spinner)
+local TextButton = require(Plugin.App.Components.TextButton)
+local Tooltip = require(Plugin.App.Components.Tooltip)
 
 local e = Roact.createElement
 
@@ -39,6 +41,21 @@ function ConnectingPage:render()
 					TextTruncate = Enum.TextTruncate.AtEnd,
 					TextTransparency = self.props.transparency,
 					BackgroundTransparency = 1,
+				})
+				else nil,
+			-- Only connections that can wait for a long time, on something that may never come, can be called off
+			Cancel = if self.props.onCancel ~= nil
+				then e(TextButton, {
+					text = "Cancel",
+					style = "Bordered",
+					transparency = self.props.transparency,
+					position = UDim2.new(0.5, 0, 1, -14),
+					anchorPoint = Vector2.new(0.5, 1),
+					onClick = self.props.onCancel,
+				}, {
+					Tip = e(Tooltip.Trigger, {
+						text = "Stop connecting",
+					}),
 				})
 				else nil,
 		})

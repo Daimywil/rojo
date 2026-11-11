@@ -176,6 +176,47 @@ pub struct ServersResponse {
     pub servers: Vec<crate::server_registry::ServerEntry>,
 }
 
+/// Response body from /api/status. Unlike the rest of the API it's JSON,
+/// since it's meant for the programs that run Rojo rather than the plugin.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusResponse {
+    pub session_id: SessionId,
+    pub server_version: String,
+    pub protocol_version: u64,
+    pub project_name: String,
+    /// The port and address the server listens on.
+    pub port: u16,
+    pub address: std::net::IpAddr,
+    /// The project's `servePlaceIds`, or null if it serves any place.
+    pub serve_place_ids: Option<Vec<u64>>,
+    /// When the server started listening, in milliseconds since the Unix
+    /// epoch.
+    pub started_at: u64,
+    /// The Studio plugins that are syncing, the one that connected first
+    /// first.
+    pub clients: Vec<StatusClient>,
+}
+
+/// A Studio plugin that is syncing with the server. What the plugin didn't
+/// say about itself is left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusClient {
+    /// Identifies the connection, also in the events of `rojo serve --events`.
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub studio_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_version: Option<String>,
+    /// When the plugin connected, in milliseconds since the Unix epoch.
+    pub connected_since: u64,
+}
+
 /// Response body from /api/read/{id}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

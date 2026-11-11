@@ -3,7 +3,10 @@ use std::{env, panic, process};
 use backtrace::Backtrace;
 use clap::Parser;
 
-use librojo::cli::Options;
+use librojo::{
+    cli::Options,
+    serve_events::{self, ServeEvent, ShutdownReason},
+};
 
 fn main() {
     #[cfg(feature = "profile-with-tracy")]
@@ -32,6 +35,12 @@ fn main() {
         );
         log::error!("");
         log::error!("Details: {}", message);
+
+        // Printed only when `rojo serve` was asked for events.
+        serve_events::emit(&ServeEvent::Shutdown {
+            reason: ShutdownReason::Panic,
+            message: Some(message.clone()),
+        });
 
         if let Some(location) = panic_info.location() {
             log::error!("in file {} on line {}", location.file(), location.line());

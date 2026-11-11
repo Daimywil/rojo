@@ -1,5 +1,6 @@
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ServerStorage = game:GetService("ServerStorage")
 local RunService = game:GetService("RunService")
@@ -21,6 +22,8 @@ local Dictionary = require(Plugin.Dictionary)
 local ServeSession = require(Plugin.ServeSession)
 local ApiContext = require(Plugin.ApiContext)
 local ServerDiscovery = require(Plugin.ServerDiscovery)
+local ConnectRequests = require(Plugin.ConnectRequests)
+local studioSessionId = require(Plugin.studioSessionId)
 local PatchSet = require(Plugin.PatchSet)
 local PatchTree = require(Plugin.PatchTree)
 local preloadAssets = require(Plugin.preloadAssets)
@@ -58,6 +61,8 @@ local ASSET_PROMPT_MIN_SHOWN = 0.5
 local PROGRESS_PANEL_DELAY = 1
 -- How often running Rojo servers are looked for while the panel shows them, in seconds
 local SERVER_DISCOVERY_INTERVAL = 5
+-- What the panel shows while a connection that a connect request asked for waits for its server to come back
+local RECONNECTING_TEXT = "Lost the connection to the Rojo server.\nReconnecting..."
 
 local function escapeRichText(text: string): string
 	return (string.gsub(text, "[&<>]", {
@@ -156,6 +161,109 @@ function App:init()
 		},
 		notifications = {},
 		toolbarIcon = Assets.Images.PluginButton,
+		-- Whether the session that's connecting is one that a connect request asked for
+		requestedConnection = false,
+	})
+
+	-- Other tools ask for connections and follow what the plugin does through attributes of CoreGui, which is local
+	-- to this Studio, so Team Create collaborators never see any of it. It's made before anything below can start a
+	-- session, since it's told about every one of them.
+	self.connectRequests = ConnectRequests.new({
+		attributes = {
+			get = function(name)
+				return CoreGui:GetAttribute(name)
+			end,
+			set = function(name, value)
+				CoreGui:SetAttribute(name, value)
+			end,
+			onChanged = function(name, callback)
+				local connection = CoreGui:GetAttributeChangedSignal(name):Connect(callback)
+				return function()
+					connection:Disconnect()
+				end
+			end,
+		},
+		scheduler = {
+			clock = os.clock,
+			now = function()
+				return DateTime.now().UnixTimestampMillis
+			end,
+			delay = task.delay,
+			cancel = task.cancel,
+			resume = task.spawn,
+		},
+		json = {
+			encode = function(value)
+				return HttpService:JSONEncode(value)
+			end,
+			decode = function(text)
+				return HttpService:JSONDecode(text)
+			end,
+		},
+		newId = function()
+			return HttpService:GenerateGUID(false)
+		end,
+		warn = function(message)
+			Log.warn(message)
+		end,
+		studioSessionId = studioSessionId(),
+		host = {
+			awaitReady = function()
+				-- Waited for, so that a request doesn't start a second session alongside the one that starts by
+				-- itself when Studio opens
+				if self.autoReconnect ~= nil then
+					self.autoReconnect:await()
+				end
+			end,
+			address = function(port)
+				-- The port in the panel is left alone until the request is sure to be carried out
+				local host, panelPort = self:getHostAndPort()
+				local portText = if port ~= nil then tostring(port) else panelPort
+				return string.format("%s:%s", host, portText), portText
+			end,
+			getSession = function()
+				local serveSession = self.serveSession
+				if serveSession == nil or serveSession:getStatus() == ServeSession.Status.NotStarted then
+					return nil
+				end
+
+				local connected = serveSession:getStatus() == ServeSession.Status.Connected
+				return {
+					address = self.sessionAddress,
+					projectName = if connected then self.state.projectName else nil,
+					connected = connected,
+				}
+			end,
+			connect = function(port, quiet)
+				self.setPort(port)
+				self:setState({
+					requestedConnection = true,
+				})
+				-- Showing a notification yields until its text is measured, which can take over ten seconds while
+				-- a Studio that just opened loads its fonts, so the session starts on its own thread
+				task.spawn(self.startSession, self, false, { quiet = quiet })
+			end,
+			disconnect = function()
+				self:endSession()
+			end,
+			legacyConnect = function(value)
+				return self:handleConnectRequest(value)
+			end,
+			showWaiting = function(text)
+				if text ~= nil then
+					self:setState({
+						appStatus = AppStatus.Connecting,
+						connectingText = escapeRichText(text),
+						toolbarIcon = Assets.Images.PluginButton,
+					})
+				elseif self.state.appStatus == AppStatus.Connecting then
+					-- The session says what it does next
+					self:setState({
+						connectingText = "",
+					})
+				end
+			end,
+		},
 	})
 
 	if RunService:IsEdit() then
@@ -196,21 +304,8 @@ function App:init()
 		end
 	end)
 
-	-- Other tools ask for a connection by setting the RojoConnectRequest attribute of CoreGui to true or a port, and
-	-- read what came of it from the RojoConnectResult attribute. An attribute is used because a thread with fewer
-	-- capabilities than this plugin, such as Studio's MCP, may not invoke a bindable of ours.
-	-- CoreGui is local to this Studio, so Team Create collaborators never see the request
-	CoreGui:SetAttribute("RojoConnectRequest", nil)
-	self.connectRequestConnection = CoreGui:GetAttributeChangedSignal("RojoConnectRequest"):Connect(function()
-		local request = CoreGui:GetAttribute("RojoConnectRequest")
-		if request == nil then
-			return
-		end
-
-		-- Cleared so that asking for the same port again still changes the attribute
-		CoreGui:SetAttribute("RojoConnectRequest", nil)
-		CoreGui:SetAttribute("RojoConnectResult", self:handleConnectRequest(request))
-	end)
+	-- Requests are only listened for now that everything they may need is there
+	self.connectRequests:start()
 end
 
 function App:didUpdate(_, previousState)
@@ -230,7 +325,7 @@ function App:willUnmount()
 	self:endSession()
 
 	self.waypointConnection:Disconnect()
-	self.connectRequestConnection:Disconnect()
+	self.connectRequests:destroy()
 	self.confirmationBindable:Destroy()
 	self.assetDecisionBindable:Destroy()
 
@@ -721,7 +816,8 @@ local function syncLockTakenMessage(owner: Player?): string
 	return string.format("Could not sync because user '%s' is already syncing", tostring(owner))
 end
 
--- Returns what came of the request, since the tool that asked can't see the Rojo panel
+-- Answers a connect request that is `true` or a port, the way they were answered before requests could be JSON (see
+-- ConnectRequests for those). Returns what came of the request, since the tool that asked can't see the Rojo panel.
 function App:handleConnectRequest(request: any): string
 	-- true connects to the port in the panel, a number connects to that port
 	local isPort = typeof(request) == "number" and request % 1 == 0 and request >= 1 and request <= 65535
@@ -765,12 +861,52 @@ function App:handleConnectRequest(request: any): string
 	return `Connecting to {host}:{port}`
 end
 
-function App:startSession(skipConfirmation: boolean?)
+-- Whether a patch only renames the DataModel. Studio names it after the place whatever the project calls it, so that
+-- difference is always there and never worth asking about.
+local function isOnlyDataModelRename(patch, instanceMap): boolean
+	if PatchSet.hasAdditions(patch) or PatchSet.hasRemoves(patch) then
+		return false
+	end
+	if not PatchSet.containsOnlyInstance(patch, instanceMap, game) then
+		return false
+	end
+
+	local datamodelUpdates = PatchSet.getUpdateForInstance(patch, instanceMap, game)
+	return datamodelUpdates ~= nil
+		and next(datamodelUpdates.changedProperties) == nil
+		and datamodelUpdates.changedClassName == nil
+end
+
+--[[
+	Starts a session with the server at the address in the panel.
+
+	`requested` is given for sessions that a JSON connect request asked for,
+	whose prompts ConnectRequests answers the way the request wants. A quiet
+	one doesn't tell the user that it starts.
+]]
+function App:startSession(skipConfirmation: boolean?, requested: { quiet: boolean }?)
+	if requested == nil then
+		-- Whatever else connects takes over from a connect request that was still waiting to reconnect
+		self.connectRequests:sessionTakenOver()
+		if self.state.requestedConnection then
+			self:setState({
+				requestedConnection = false,
+			})
+		end
+	end
+
 	local claimedLock, priorOwner = self:claimSyncLock()
 	if not claimedLock then
 		local msg = syncLockTakenMessage(priorOwner)
 
 		Log.warn(msg)
+		-- Before the notification, which can take a while to show
+		self.connectRequests:sessionEnded(
+			ConnectRequests.protocol.codedError(ConnectRequests.protocol.Code.sync_lock_held, msg)
+		)
+		self:setState({
+			requestedConnection = false,
+		})
 		self:addNotification({
 			text = msg,
 			timeout = 10,
@@ -790,10 +926,13 @@ function App:startSession(skipConfirmation: boolean?)
 		then string.format("%s:%s", host, port)
 		else string.format("http://%s:%s", host, port)
 	local apiContext = ApiContext.new(baseUrl)
+	local address = ("%s:%s"):format(host, port)
 
 	local serveSession = ServeSession.new({
 		apiContext = apiContext,
 		twoWaySync = Settings:get("twoWaySync"),
+		-- Whoever made a connect request gets to decide that Studio wins, whether two-way sync is on or not
+		allowReject = requested ~= nil,
 	})
 
 	serveSession:setUpdateLoadingTextCallback(function(text: string)
@@ -843,25 +982,37 @@ function App:startSession(skipConfirmation: boolean?)
 				self.dismissSyncReminder = nil
 			end
 
+			self.connectRequests:sessionStarting({
+				address = address,
+				port = port,
+			})
 			self:setState({
 				appStatus = AppStatus.Connecting,
 				toolbarIcon = Assets.Images.PluginButton,
 			})
-			self:addNotification({
-				text = "Connecting to session...",
-			})
+			-- A connection that keeps trying to reconnect would say this every few seconds
+			if requested == nil or not requested.quiet then
+				self:addNotification({
+					text = "Connecting to session...",
+				})
+			end
 		elseif status == ServeSession.Status.Connected then
 			self.knownProjects[details] = true
 			self:setPriorSyncInfo(host, port, details)
 			self:setLastConnectionPort(port)
 			self:setRunningConnectionInfo(baseUrl)
 
-			local address = ("%s:%s"):format(host, port)
 			self:setState({
 				appStatus = AppStatus.Connected,
 				projectName = details,
 				address = address,
 				toolbarIcon = Assets.Images.PluginButtonConnected,
+				requestedConnection = false,
+			})
+			self.connectRequests:sessionConnected({
+				address = address,
+				port = port,
+				projectName = details,
 			})
 			self:addNotification({
 				text = string.format("Connected to session '%s' at %s.", details, address),
@@ -878,12 +1029,38 @@ function App:startSession(skipConfirmation: boolean?)
 				},
 			})
 
-			-- Details being present indicates that this
-			-- disconnection was from an error.
-			if details ~= nil then
+			-- A connection that a connect request asked for may be tried again, or have ended because that's
+			-- what was asked for, neither of which is an error to show
+			local shown = self.connectRequests:sessionEnded(details)
+			if shown == "quiet" then
+				details = nil
+			end
+
+			if shown == "reconnecting" then
+				Log.info("Lost the connection to the Rojo server: {}. Reconnecting...", details)
+
+				local wasReconnecting = self.state.appStatus == AppStatus.Connecting
+					and self.state.requestedConnection
+				self:setState({
+					appStatus = AppStatus.Connecting,
+					connectingText = escapeRichText(RECONNECTING_TEXT),
+					toolbarIcon = Assets.Images.PluginButton,
+					requestedConnection = true,
+				})
+				-- Said once, not for every attempt that fails
+				if not wasReconnecting then
+					self:addNotification({
+						text = RECONNECTING_TEXT,
+						timeout = 10,
+					})
+				end
+			elseif details ~= nil then
+				-- Details being present indicates that this
+				-- disconnection was from an error.
 				Log.warn("Disconnected from an error: {}", details)
 
 				self:setState({
+					requestedConnection = false,
 					appStatus = AppStatus.Error,
 					errorMessage = tostring(details),
 					toolbarIcon = Assets.Images.PluginButtonWarning,
@@ -896,6 +1073,7 @@ function App:startSession(skipConfirmation: boolean?)
 				self:setState({
 					appStatus = AppStatus.NotConnected,
 					toolbarIcon = Assets.Images.PluginButton,
+					requestedConnection = false,
 				})
 				self:addNotification({
 					text = "Disconnected from session.",
@@ -905,7 +1083,7 @@ function App:startSession(skipConfirmation: boolean?)
 		end
 	end)
 
-	serveSession:setConfirmCallback(function(instanceMap, patch, serverInfo)
+	local function confirmPatch(instanceMap, patch, serverInfo)
 		if PatchSet.isEmpty(patch) then
 			Log.trace("Accepting patch without confirmation because it is empty")
 			return "Accept"
@@ -958,20 +1136,9 @@ function App:startSession(skipConfirmation: boolean?)
 
 		-- The datamodel name gets overwritten by Studio, making confirmation of it intrusive
 		-- and unnecessary. This special case allows it to be accepted without confirmation.
-		if
-			PatchSet.hasAdditions(patch) == false
-			and PatchSet.hasRemoves(patch) == false
-			and PatchSet.containsOnlyInstance(patch, instanceMap, game)
-		then
-			local datamodelUpdates = PatchSet.getUpdateForInstance(patch, instanceMap, game)
-			if
-				datamodelUpdates ~= nil
-				and next(datamodelUpdates.changedProperties) == nil
-				and datamodelUpdates.changedClassName == nil
-			then
-				Log.trace("Accepting patch without confirmation because it only contains a datamodel name change")
-				return "Accept"
-			end
+		if isOnlyDataModelRename(patch, instanceMap) then
+			Log.trace("Accepting patch without confirmation because it only contains a datamodel name change")
+			return "Accept"
 		end
 
 		self:setState({
@@ -994,6 +1161,7 @@ function App:startSession(skipConfirmation: boolean?)
 			timeout = 7,
 		})
 
+		self.connectRequests:promptShown()
 		local decision = self.confirmationEvent:Wait()
 
 		-- Connecting can take a while after this, like when assets are synced into a place that doesn't have them
@@ -1019,9 +1187,30 @@ function App:startSession(skipConfirmation: boolean?)
 		end
 
 		return decision
+	end
+
+	serveSession:setConfirmCallback(function(instanceMap, patch, serverInfo)
+		-- A connect request can say which side wins, or want to be asked. For every other session, and for
+		-- requests that leave it to the user, it's decided here like it always was.
+		local trivial = PatchSet.isEmpty(patch) or isOnlyDataModelRename(patch, instanceMap)
+		local decision = self.connectRequests:decidePatch(function()
+			return ConnectRequests.protocol.summarizePatch(patch, instanceMap, game)
+		end, trivial)
+
+		if decision == nil then
+			decision = confirmPatch(instanceMap, patch, serverInfo)
+			self.connectRequests:promptAnswered(decision)
+		end
+
+		return decision
 	end)
 
 	serveSession:setAssetConfirmCallback(function(summary)
+		local requestedDecision = self.connectRequests:decideAssets(summary)
+		if requestedDecision ~= nil then
+			return requestedDecision
+		end
+
 		self.assetPromptShownAt = os.clock()
 		self:setState({
 			appStatus = AppStatus.AssetConflicts,
@@ -1038,7 +1227,9 @@ function App:startSession(skipConfirmation: boolean?)
 			timeout = 7,
 		})
 
+		self.connectRequests:promptShown()
 		local decision = self.assetDecisionBindable.Event:Wait()
+		self.connectRequests:promptAnswered(decision, summary)
 
 		if decision ~= "Abort" then
 			self:setState({
@@ -1059,12 +1250,24 @@ function App:startSession(skipConfirmation: boolean?)
 	-- Set before starting, since starting yields while it shows a notification, and anything that checks for a
 	-- running session in the meantime, like a connect request, has to find this one
 	self.serveSession = serveSession
+	self.sessionAddress = address
 
 	serveSession:start()
 end
 
 function App:endSession()
+	-- Ending a session on purpose is not a failure, and nothing reconnects after it
+	self.connectRequests:stopping()
+
 	if self.serveSession == nil then
+		-- A connection that a connect request asked for can be waiting to reconnect, without a session to stop
+		self.connectRequests:stopped()
+		if self.state.appStatus == AppStatus.Connecting then
+			self:setState({
+				appStatus = AppStatus.NotConnected,
+				requestedConnection = false,
+			})
+		end
 		return
 	end
 
@@ -1074,12 +1277,21 @@ function App:endSession()
 	if self.state.appStatus == AppStatus.AssetConflicts then
 		self.assetDecisionBindable:Fire("Abort")
 	end
+	local wasConfirming = self.state.appStatus == AppStatus.Confirming
 
 	self.serveSession:stop()
 	self.serveSession = nil
 	self:setState({
 		appStatus = AppStatus.NotConnected,
+		requestedConnection = false,
 	})
+
+	-- The same goes for the sync confirmation, which is answered only now that the session is stopped, so that it
+	-- can't act on the answer. Left waiting, it would take the answer to the next session's confirmation as its own.
+	if wasConfirming then
+		self.confirmationBindable:Fire("Abort")
+	end
+	self.connectRequests:stopped()
 
 	if self.cleanupPrecommit ~= nil then
 		self.cleanupPrecommit()
@@ -1196,6 +1408,13 @@ function App:render()
 
 					Connecting = createPageElement(AppStatus.Connecting, {
 						text = self.state.connectingText,
+						-- Connections that a connect request asked for can wait for minutes, for a decision or
+						-- for their server to come back
+						onCancel = if self.state.requestedConnection
+							then function()
+								self:endSession()
+							end
+							else nil,
 					}),
 
 					Connected = createPageElement(AppStatus.Connected, {
@@ -1292,7 +1511,10 @@ function App:render()
 				icon = Assets.Images.PluginButton,
 				bindable = true,
 				onTriggered = function()
-					if self.serveSession ~= nil and self.serveSession:getStatus() == ServeSession.Status.Connected then
+					if
+						(self.serveSession ~= nil and self.serveSession:getStatus() == ServeSession.Status.Connected)
+						or self.connectRequests:isWaiting()
+					then
 						self:endSession()
 					end
 				end,

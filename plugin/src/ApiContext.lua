@@ -7,6 +7,8 @@ local Promise = require(Packages.Promise)
 local Config = require(script.Parent.Config)
 local Types = require(script.Parent.Types)
 local Version = require(script.Parent.Version)
+local connectProtocol = require(script.Parent.ConnectRequests.protocol)
+local studioSessionId = require(script.Parent.studioSessionId)
 
 local validateApiInfo = Types.ifEnabled(Types.ApiInfoResponse)
 local validateApiRead = Types.ifEnabled(Types.ApiReadResponse)
@@ -40,7 +42,8 @@ local function rejectWrongProtocolVersion(infoResponseBody)
 			infoResponseBody.protocolVersion
 		)
 
-		return Promise.reject(message)
+		-- Tools that asked for the connection are told why it failed as a code, which the text can't be relied on for
+		return Promise.reject(connectProtocol.codedError(connectProtocol.Code.version_mismatch, message))
 	end
 
 	return Promise.resolve(infoResponseBody)
@@ -63,7 +66,7 @@ local function rejectWrongPlaceId(infoResponseBody)
 				.. "\n\nTo change this list, edit 'servePlaceIds' in your .project.json file."
 			):format(game.PlaceId, table.concat(idList, "\n"))
 
-			return Promise.reject(message)
+			return Promise.reject(connectProtocol.codedError(connectProtocol.Code.place_not_served, message))
 		end
 	end
 
@@ -83,11 +86,27 @@ local function rejectWrongPlaceId(infoResponseBody)
 				.. "\n\nTo change this list, edit 'blockedPlaceIds' in your .project.json file."
 			):format(game.PlaceId, table.concat(idList, "\n"))
 
-			return Promise.reject(message)
+			return Promise.reject(connectProtocol.codedError(connectProtocol.Code.place_not_served, message))
 		end
 	end
 
 	return Promise.resolve(infoResponseBody)
+end
+
+--[[
+	What the plugin says about itself when it starts syncing, as the query of
+	the URL it connects to: the place it has open and which Studio it is. The
+	server passes that on to programs that follow what it does, so that they
+	know which Studio is connected. Servers from before this ignore it.
+]]
+local function clientQuery(): string
+	return string.format(
+		"placeId=%d&gameId=%d&studioSessionId=%s&pluginVersion=%s",
+		game.PlaceId,
+		game.GameId,
+		HttpService:UrlEncode(studioSessionId()),
+		HttpService:UrlEncode(Version.display(Config.version))
+	)
 end
 
 local ApiContext = {}
@@ -221,7 +240,7 @@ function ApiContext:write(patch)
 end
 
 function ApiContext:connectWebSocket(packetHandlers)
-	local url = ("%s/api/socket/%s"):format(self.__baseUrl, self.__messageCursor)
+	local url = ("%s/api/socket/%s?%s"):format(self.__baseUrl, self.__messageCursor, clientQuery())
 	-- Convert HTTP/HTTPS URL to WS/WSS
 	url = url:gsub("^http://", "ws://"):gsub("^https://", "wss://")
 

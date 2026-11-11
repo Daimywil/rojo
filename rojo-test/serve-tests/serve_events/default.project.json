@@ -1,0 +1,7 @@
+{
+  "name": "serve_events",
+  "servePlaceIds": [456, 123],
+  "tree": {
+    "$path": "src"
+  }
+}

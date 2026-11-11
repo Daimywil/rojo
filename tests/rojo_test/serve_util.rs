@@ -1,10 +1,14 @@
 use std::{
     fs,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
+    process::{Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use hyper_tungstenite::tungstenite::{connect, Message};
@@ -14,9 +18,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tempfile::{tempdir, TempDir};
 
 use librojo::{
+    serve_events::EVENT_PREFIX,
     web_api::{
         AssetsResponse, AssetsSocketPacket, ReadResponse, SerializeRequest, SerializeResponse,
-        ServerInfoResponse, SocketPacket, SocketPacketType,
+        ServerInfoResponse, SocketPacket, SocketPacketType, StatusResponse, WriteRequest,
     },
     SessionId,
 };
@@ -66,10 +71,35 @@ pub struct TestServeSession {
 
     port: usize,
     project_path: PathBuf,
+
+    /// Every line the server prints to stdout, if its output is captured.
+    stdout_lines: Option<Receiver<String>>,
 }
 
 impl TestServeSession {
     pub fn new(name: &str) -> Self {
+        Self::start(name, &[], false, None)
+    }
+
+    /// Starts a server that prints events, with its stdout and stdin
+    /// connected to the test instead of the terminal.
+    pub fn new_with_events(name: &str) -> Self {
+        Self::start(name, &["--events", "json"], true, None)
+    }
+
+    /// Like `new_with_events`, but on a port of the test's choosing, like one
+    /// that is already taken.
+    pub fn new_with_events_on_port(name: &str, port: usize) -> Self {
+        Self::start(name, &["--events", "json"], true, Some(port))
+    }
+
+    /// Starts a server without events whose stdout is still captured, to
+    /// check what it prints.
+    pub fn new_with_captured_output(name: &str) -> Self {
+        Self::start(name, &[], true, None)
+    }
+
+    fn start(name: &str, extra_args: &[&str], capture: bool, port: Option<usize>) -> Self {
         let working_dir = get_working_dir_path();
 
         let source_path = Path::new(SERVE_TESTS_PATH).join(name);
@@ -100,26 +130,147 @@ impl TestServeSession {
         #[cfg(target_os = "macos")]
         std::thread::sleep(Duration::from_millis(100));
 
-        let port = get_port_number();
+        let port = port.unwrap_or_else(get_port_number);
         let port_string = port.to_string();
 
-        let rojo_process = Command::new(ROJO_PATH)
+        let mut command = Command::new(ROJO_PATH);
+        command
             .args([
                 "serve",
                 project_path.to_str().unwrap(),
                 "--port",
                 port_string.as_str(),
             ])
-            .current_dir(working_dir)
-            .spawn()
-            .expect("Couldn't start Rojo");
+            .args(extra_args)
+            .current_dir(working_dir);
+
+        if capture {
+            command.stdin(Stdio::piped()).stdout(Stdio::piped());
+        }
+
+        let mut rojo_process = command.spawn().expect("Couldn't start Rojo");
+
+        // Read on another thread, so that waiting for a line can time out.
+        let stdout_lines = rojo_process.stdout.take().map(|stdout| {
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            receiver
+        });
 
         TestServeSession {
             rojo_process: KillOnDrop(rojo_process),
             _dir: dir,
             port,
             project_path,
+            stdout_lines,
         }
+    }
+
+    /// Waits for the next event with the given name, skipping other events
+    /// and anything else the server prints.
+    pub fn wait_for_event(&self, name: &str) -> serde_json::Value {
+        let lines = self
+            .stdout_lines
+            .as_ref()
+            .expect("the server was not started with captured output");
+        let deadline = Instant::now() + Duration::from_secs(20);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = lines
+                .recv_timeout(remaining)
+                .unwrap_or_else(|_| panic!("the server did not send a {name} event in time"));
+
+            let Some(json) = line.strip_prefix(EVENT_PREFIX) else {
+                continue;
+            };
+            let event: serde_json::Value =
+                serde_json::from_str(json).expect("event lines should hold JSON");
+            assert!(
+                event["time"].as_u64().is_some_and(|time| time > 0),
+                "every event should say when it happened: {event}"
+            );
+
+            if event["event"] == name {
+                return event;
+            }
+        }
+    }
+
+    /// Everything the server printed to stdout until now.
+    pub fn stdout_so_far(&self) -> Vec<String> {
+        self.stdout_lines
+            .as_ref()
+            .expect("the server was not started with captured output")
+            .try_iter()
+            .collect()
+    }
+
+    /// Sends a line to the server on stdin.
+    pub fn write_stdin_line(&mut self, line: &str) {
+        let stdin = self
+            .rojo_process
+            .0
+            .stdin
+            .as_mut()
+            .expect("the server was not started with captured output");
+        writeln!(stdin, "{line}").expect("Couldn't write to Rojo's stdin");
+        stdin.flush().expect("Couldn't write to Rojo's stdin");
+    }
+
+    /// Waits for the server to stop by itself.
+    pub fn wait_for_exit(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(20);
+
+        loop {
+            if let Some(status) = self
+                .rojo_process
+                .0
+                .try_wait()
+                .expect("Couldn't wait on Rojo")
+            {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "the server did not stop in time");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn get_api_status(&self) -> StatusResponse {
+        let url = format!("http://localhost:{}/api/status", self.port);
+        let response = reqwest::blocking::get(url).expect("Failed to send request");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+        );
+
+        response
+            .json()
+            .expect("Server returned a malformed status response")
+    }
+
+    /// Opens the socket the plugin syncs over, like a plugin that says
+    /// `query` about itself, or nothing if it's empty.
+    pub fn connect_api_socket(&self, query: &str) -> ClientSocket {
+        let separator = if query.is_empty() { "" } else { "?" };
+        let url = format!(
+            "ws://localhost:{}/api/socket/0{separator}{query}",
+            self.port
+        );
+
+        let (socket, _response) = connect(url).expect("Couldn't connect to /api/socket");
+        socket
     }
 
     pub fn path(&self) -> &Path {
@@ -244,6 +395,20 @@ impl TestServeSession {
         client.post(url).body(body).send()
     }
 
+    /// Sends changes made in Studio to `/api/write`, like the plugin does
+    /// with two-way sync and when Studio wins the initial sync.
+    pub fn post_api_write(&self, request: &WriteRequest) -> reqwest::StatusCode {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://localhost:{}/api/write", self.port);
+
+        client
+            .post(url)
+            .body(serialize_msgpack(request).unwrap())
+            .send()
+            .expect("Failed to send request")
+            .status()
+    }
+
     pub fn get_api_assets(&self) -> Result<AssetsResponse, reqwest::Error> {
         let url = format!("http://localhost:{}/api/assets", self.port);
         let body = reqwest::blocking::get(url)?.bytes()?;
@@ -343,6 +508,17 @@ impl TestServeSession {
             .expect("Failed to send request")
             .status()
     }
+}
+
+pub type ClientSocket = hyper_tungstenite::tungstenite::WebSocket<
+    hyper_tungstenite::tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+>;
+
+/// Closes a socket the way a plugin that disconnects does, and waits for the
+/// server to close its side.
+pub fn close_socket(mut socket: ClientSocket) {
+    let _ = socket.close(None);
+    while socket.read().is_ok() {}
 }
 
 fn serialize_msgpack<T: Serialize>(value: T) -> Result<Vec<u8>, rmp_serde::encode::Error> {

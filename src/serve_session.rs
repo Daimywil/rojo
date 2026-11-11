@@ -218,6 +218,16 @@ impl ServeSession {
         self.root_project.serve_place_ids.as_ref()
     }
 
+    /// The places the project may be served to, in an order that is the same
+    /// every time, for showing them to people and programs.
+    pub fn sorted_serve_place_ids(&self) -> Option<Vec<u64>> {
+        self.serve_place_ids().map(|ids| {
+            let mut ids: Vec<u64> = ids.iter().copied().collect();
+            ids.sort_unstable();
+            ids
+        })
+    }
+
     pub fn blocked_place_ids(&self) -> Option<&HashSet<u64>> {
         self.root_project.blocked_place_ids.as_ref()
     }

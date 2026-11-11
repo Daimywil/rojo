@@ -12,6 +12,7 @@ use std::{
 use crate::{
     assets::AssetStore,
     message_queue::MessageQueue,
+    serve_events,
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
     },
@@ -163,6 +164,21 @@ fn canonicalize_event_path(vfs: &Vfs, path: &Path) -> Option<PathBuf> {
         missing.push(existing.file_name()?);
         existing = existing.parent()?;
     }
+}
+
+/// Whether a path is a script's own file, which is the only kind of file a
+/// script's source may be written to.
+///
+/// An instance isn't always tracked by a file that holds its source: the
+/// root of a project is tracked by its project file, a script that is the
+/// `init` file of a directory by that directory, and modules made from data
+/// like JSON by that data. Writing a source there would replace the file
+/// with Lua.
+fn is_script_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("lua" | "luau")
+    )
 }
 
 impl JobThreadContext {
@@ -347,6 +363,13 @@ impl JobThreadContext {
                                 &instance.metadata().instigating_source
                             {
                                 match instigating_source {
+                                    InstigatingSource::Path(path) if !is_script_file(path) => {
+                                        log::warn!(
+                                            "Cannot write the source of instance {:?} to {}, because that is not a Lua file.",
+                                            id,
+                                            path.display()
+                                        );
+                                    }
                                     InstigatingSource::Path(path) => {
                                         if let Some(Variant::String(value)) = changed_value {
                                             if let Err(err) = fs::write(path, value) {
@@ -421,9 +444,11 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                     Ok(snapshot) => snapshot,
                     Err(err) => {
                         log::error!("Snapshot error: {:?}", err);
+                        serve_events::sync_error(path, format!("{err:#}"));
                         return None;
                     }
                 };
+                serve_events::sync_ok(path);
 
                 let patch_set = compute_patch_set(snapshot, tree, id);
                 apply_patch_set(tree, patch_set)
@@ -435,6 +460,9 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 // We associate deleting the instigating file for an
                 // instance with deleting that instance.
 
+                // Whatever was wrong with it went away with it.
+                serve_events::sync_ok(path);
+
                 let mut patch_set = PatchSet::new();
                 patch_set.removed_instances.push(id);
 
@@ -442,6 +470,7 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
             }
             Err(err) => {
                 log::error!("Error processing filesystem change: {:?}", err);
+                serve_events::sync_error(path, err.to_string());
                 return None;
             }
         },
@@ -469,9 +498,11 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     log::error!("{:?}", err);
+                    serve_events::sync_error(path, format!("{err:#}"));
                     return None;
                 }
             };
+            serve_events::sync_ok(path);
 
             let patch_set = compute_patch_set(snapshot, tree, id);
             apply_patch_set(tree, patch_set)

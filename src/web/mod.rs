@@ -4,12 +4,14 @@
 
 mod api;
 mod assets;
+mod clients;
 pub mod interface;
 mod origin;
 mod ui;
 mod util;
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,10 +24,26 @@ use hyper::{
 };
 use tokio::runtime::{Handle, Runtime};
 
-use crate::{serve_session::ServeSession, server_registry};
+use crate::{
+    serve_events::{self, DisconnectReason},
+    serve_session::ServeSession,
+    server_registry,
+};
+
+use self::clients::ConnectedClients;
 
 pub struct LiveServer {
     serve_session: Arc<ServeSession>,
+}
+
+/// What a running server knows about itself beyond its session, for
+/// `/api/status`.
+pub struct ServerStatus {
+    /// The address the server listens on.
+    pub address: SocketAddr,
+    /// When it started listening, in milliseconds since the Unix epoch.
+    pub started_at: u64,
+    pub clients: Arc<ConnectedClients>,
 }
 
 impl LiveServer {
@@ -41,23 +59,38 @@ impl LiveServer {
     /// `on_listening` is invoked once the server has successfully bound to the
     /// address, so callers can defer printing any "listening" message until
     /// after binding can no longer fail (e.g. due to the port being in use).
+    ///
+    /// The server stops accepting connections, and this returns, once
+    /// `shutdown` completes. Pass a future that never does to serve until the
+    /// process ends. Connections that are open keep being served until the
+    /// process ends, which is expected to be right after this returns.
     pub fn start(
         self,
         address: SocketAddr,
         allowed_hosts: Vec<String>,
         on_listening: impl FnOnce(),
+        shutdown: impl Future<Output = ()>,
     ) -> anyhow::Result<()> {
         let serve_session = Arc::clone(&self.serve_session);
         let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), &allowed_hosts);
 
+        let clients = Arc::new(ConnectedClients::default());
+        let status = Arc::new(ServerStatus {
+            address,
+            started_at: serve_events::unix_millis(),
+            clients: Arc::clone(&clients),
+        });
+
         let make_service = make_service_fn(move |conn: &AddrStream| {
             let serve_session = Arc::clone(&serve_session);
+            let status = Arc::clone(&status);
             let allowed_hosts = allowed_hosts.clone();
             let remote_addr = conn.remote_addr();
 
             async move {
                 let service = move |req: Request<Body>| {
                     let serve_session = Arc::clone(&serve_session);
+                    let status = Arc::clone(&status);
                     let allowed_hosts = allowed_hosts.clone();
 
                     async move {
@@ -70,7 +103,9 @@ impl LiveServer {
                         }
 
                         if req.uri().path().starts_with("/api") {
-                            Ok::<_, Infallible>(api::call(serve_session, remote_addr, req).await)
+                            Ok::<_, Infallible>(
+                                api::call(serve_session, status, remote_addr, req).await,
+                            )
                         } else {
                             Ok::<_, Infallible>(ui::call(serve_session, req).await)
                         }
@@ -82,7 +117,7 @@ impl LiveServer {
         });
 
         let rt = Runtime::new().context("Failed to start the async runtime for the web server")?;
-        let _guard = rt.enter();
+        let guard = rt.enter();
         let server = Server::try_bind(&address)
             .with_context(|| {
                 format!(
@@ -103,8 +138,27 @@ impl LiveServer {
             .spawn(move || hold_discovery_port(handle))
             .context("Could not start listening on the discovery port")?;
 
-        rt.block_on(server)
-            .context("The Rojo web server encountered a fatal error")?;
+        let result = rt.block_on(async {
+            tokio::select! {
+                result = server => {
+                    result.context("The Rojo web server encountered a fatal error")
+                }
+                _ = shutdown => Ok(()),
+            }
+        });
+
+        // The thread that holds the discovery port uses the runtime for as
+        // long as the process runs, and panics if the runtime is shut down
+        // under it. The process is about to end whenever this returns, so the
+        // runtime is left running until then rather than dropped here.
+        drop(guard);
+        std::mem::forget(rt);
+
+        result?;
+
+        // Whoever follows the server's events hears that its clients are
+        // gone before it hears that the server is.
+        clients.disconnect_all(DisconnectReason::ServerShutdown);
 
         Ok(())
     }

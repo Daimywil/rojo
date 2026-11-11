@@ -1,18 +1,20 @@
 use std::{
-    io::{self, Write},
+    io::{self, BufRead, Write},
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
-use clap::Parser;
+use clap::{ArgEnum, Parser};
+use futures::channel::oneshot;
 use memofs::Vfs;
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
 use crate::{
+    serve_events::{self, ServeEvent, ShutdownReason},
     serve_session::ServeSession,
     server_registry::{self, ServerEntry},
-    web::LiveServer,
+    web::{interface::PROTOCOL_VERSION, LiveServer},
 };
 
 use super::{resolve_path, GlobalOptions};
@@ -43,10 +45,43 @@ pub struct ServeCommand {
     /// validation for binds where it is otherwise off (such as `0.0.0.0`).
     #[clap(long, value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
+
+    /// Print what the server does as events, for programs that run Rojo.
+    /// With `json`, every event is one line on stdout: `@rojo-event `
+    /// followed by a JSON object. A line saying `shutdown` on stdin then
+    /// stops the server.
+    #[clap(long, arg_enum, value_name = "FORMAT")]
+    pub events: Option<EventFormat>,
+}
+
+/// How `rojo serve --events` prints events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ArgEnum)]
+pub enum EventFormat {
+    Json,
 }
 
 impl ServeCommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
+        if self.events.is_some() {
+            serve_events::enable();
+        }
+
+        let result = self.serve(global);
+
+        // Whoever runs Rojo learns why it stops from its events, without
+        // having to make sense of what's logged for people.
+        serve_events::emit(&ServeEvent::Shutdown {
+            reason: match &result {
+                Ok(()) => ShutdownReason::Requested,
+                Err(_) => ShutdownReason::Error,
+            },
+            message: result.as_ref().err().map(|err| format!("{err:#}")),
+        });
+
+        result
+    }
+
+    fn serve(self, global: GlobalOptions) -> anyhow::Result<()> {
         let project_path = resolve_path(&self.project)?;
 
         let vfs = Vfs::new_default()?;
@@ -81,25 +116,85 @@ impl ServeCommand {
             session.project_name().to_owned(),
             session.root_project().file_location.clone(),
         );
-        let server = LiveServer::new(session);
+        let listening = ServeEvent::Listening {
+            port,
+            address: ip,
+            project_name: session.project_name().to_owned(),
+            serve_place_ids: session.sorted_serve_place_ids(),
+            session_id: session.session_id(),
+            server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let server = LiveServer::new(Arc::clone(&session));
 
         // Kept until the server stops, so the plugin can find it (see
         // `server_registry`).
         let mut registration = None;
 
-        server.start((ip, port).into(), allowed_hosts, || {
-            let _ = show_start_message(ip, port, global.color.into());
+        // Without events, nothing ever asks the server to stop, and it runs
+        // until the process is ended, like it always has. The sender is kept
+        // here either way, because the server would stop if it were dropped.
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
+        let shutdown_sender = Arc::new(Mutex::new(Some(shutdown_sender)));
+        if serve_events::is_enabled() {
+            listen_for_shutdown(Arc::clone(&shutdown_sender));
+        }
 
-            match server_registry::register(&entry) {
-                Ok(registered) => registration = Some(registered),
-                Err(err) => log::warn!(
-                    "Could not register this server, so the Studio plugin won't list it: {err}"
-                ),
-            }
-        })?;
+        server.start(
+            (ip, port).into(),
+            allowed_hosts,
+            || {
+                let _ = show_start_message(ip, port, global.color.into());
 
+                match server_registry::register(&entry) {
+                    Ok(registered) => registration = Some(registered),
+                    Err(err) => log::warn!(
+                        "Could not register this server, so the Studio plugin won't list it: {err}"
+                    ),
+                }
+
+                serve_events::emit(&listening);
+            },
+            async {
+                let _ = shutdown_receiver.await;
+            },
+        )?;
+
+        // Only reached when the server was asked to stop, which unlike being
+        // killed leaves time to save what asset sync remembers.
+        drop(shutdown_sender);
+        session.asset_store().flush();
         drop(registration);
         Ok(())
+    }
+}
+
+/// Asks the server to stop once a line saying `shutdown` arrives on stdin.
+///
+/// A program that runs Rojo can't always send it a signal, least of all on
+/// Windows, and ending the process doesn't let the server say that it stops.
+/// Stdin being closed is not taken as a request to stop, since it's closed
+/// from the start when Rojo is run without one.
+fn listen_for_shutdown(sender: Arc<Mutex<Option<oneshot::Sender<()>>>>) {
+    let spawned = std::thread::Builder::new()
+        .name("Rojo stdin".to_owned())
+        .spawn(move || {
+            for line in io::stdin().lock().lines() {
+                match line {
+                    Ok(line) if line.trim() == "shutdown" => {
+                        if let Some(sender) = sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+    if let Err(err) = spawned {
+        log::warn!("Could not listen for a shutdown request on stdin: {err}");
     }
 }
 

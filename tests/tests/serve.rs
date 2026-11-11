@@ -1,7 +1,10 @@
-use std::fs;
+use std::{collections::HashMap, fs, thread, time::Duration};
 
 use insta::{assert_snapshot, assert_yaml_snapshot, with_settings};
-use rbx_dom_weak::types::Ref;
+use rbx_dom_weak::{
+    types::{Ref, Variant},
+    ustr, UstrMap,
+};
 use reqwest::StatusCode;
 use tempfile::tempdir;
 
@@ -10,7 +13,7 @@ use crate::rojo_test::{
     serve_util::{deserialize_msgpack, run_serve_test, serialize_to_xml_model},
 };
 
-use librojo::web_api::{SerializeResponse, SocketPacketType};
+use librojo::web_api::{InstanceUpdate, SerializeResponse, SocketPacketType, WriteRequest};
 
 #[test]
 fn rejects_dns_rebinding_requests() {
@@ -773,5 +776,122 @@ fn forced_parent() {
 
         let model = serialize_to_xml_model(&serialize_response, &redactions);
         assert_snapshot!("forced_parent_serialize_model", model);
+    });
+}
+
+/// A change to the source of a script, as the plugin sends it.
+fn source_update(id: Ref, source: &str) -> InstanceUpdate {
+    let mut changed_properties = UstrMap::default();
+    changed_properties.insert(ustr("Source"), Some(Variant::String(source.to_owned())));
+
+    InstanceUpdate {
+        id,
+        changed_name: None,
+        changed_class_name: None,
+        changed_properties,
+        changed_metadata: None,
+    }
+}
+
+/// What reaches the files when Studio wins the initial sync is whatever
+/// `/api/write` does with the differences the plugin sends back, which this
+/// pins down: the sources of scripts that have a file of their own, and
+/// nothing else.
+#[test]
+fn write_only_puts_script_sources_in_files() {
+    run_serve_test("scripts", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let read_response = session.get_api_read(info.root_instance_id).unwrap();
+
+        let id_of = |name: &str| {
+            read_response
+                .instances
+                .values()
+                .find(|instance| instance.name == name)
+                .unwrap_or_else(|| panic!("the project should have an instance named {name}"))
+                .id
+        };
+        let foo = id_of("foo");
+        let bar = id_of("bar");
+
+        let foo_path = session.path().join("src/foo.lua");
+        let bar_path = session.path().join("src/bar.server.lua");
+        let bar_source = fs::read_to_string(&bar_path).unwrap();
+
+        // What the plugin sends when Studio wins: the properties of instances
+        // that differ, and the instances the files have that Studio doesn't
+        // as removed.
+        let mut foo_update = source_update(foo, "return 'from Studio'");
+        foo_update
+            .changed_properties
+            .insert(ustr("Disabled"), Some(Variant::Bool(true)));
+        foo_update.changed_name = Some("renamed".to_owned());
+
+        let status = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            removed: vec![bar],
+            added: HashMap::new(),
+            updated: vec![foo_update],
+        });
+        assert_eq!(status, StatusCode::OK);
+
+        // The request is answered before it's carried out.
+        for _ in 0..100 {
+            if fs::read_to_string(&foo_path).unwrap() == "return 'from Studio'" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            fs::read_to_string(&foo_path).unwrap(),
+            "return 'from Studio'",
+            "the source of a script should be written to its file"
+        );
+
+        // Nothing is deleted, renamed or created for anything else that was
+        // sent.
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(fs::read_to_string(&bar_path).unwrap(), bar_source);
+        let mut files: Vec<String> = fs::read_dir(session.path().join("src"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["bar.server.lua", "foo.lua"]);
+    });
+}
+
+/// A script that is the `init` file of a directory has no file of its own as
+/// far as `/api/write` is concerned, so Studio winning doesn't reach it.
+#[test]
+fn write_does_not_reach_init_scripts() {
+    run_serve_test("edit_init", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+
+        let init_path = session.path().join("src/init.lua");
+        let init_source = fs::read_to_string(&init_path).unwrap();
+        let project_path = session.path().join("default.project.json");
+        let project_source = fs::read_to_string(&project_path).unwrap();
+
+        let status = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            removed: Vec::new(),
+            added: HashMap::new(),
+            updated: vec![source_update(info.root_instance_id, "return 'from Studio'")],
+        });
+        assert_eq!(status, StatusCode::OK);
+
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(fs::read_to_string(&init_path).unwrap(), init_source);
+        // The root of a project is tracked by its project file, which must
+        // never be taken for the file of the script.
+        assert_eq!(
+            fs::read_to_string(&project_path).unwrap(),
+            project_source,
+            "the project file should be left alone"
+        );
+        session
+            .get_api_rojo()
+            .expect("the server should keep running");
     });
 }
