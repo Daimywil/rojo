@@ -26,15 +26,15 @@ use crate::{
     web::{
         clients::{ClientConnection, ClientDetails},
         interface::{
-            AssetContainer, AssetFile, AssetFileChange, AssetGroup, AssetPlanEntry, AssetSynced,
-            AssetWriteFailure, AssetsAckRequest, AssetsApplyRequest, AssetsGroupsRequest,
-            AssetsKnownRequest, AssetsKnownResponse, AssetsOkResponse, AssetsPlanRequest,
-            AssetsPlanResponse, AssetsReadRequest, AssetsReadResponse, AssetsResponse,
-            AssetsSessionRequest, AssetsSocketPacket, AssetsStageRequest, AssetsWriteRequest,
-            AssetsWriteResponse, ErrorResponse, Instance, MessagesPacket, OpenResponse,
-            ReadResponse, ServerInfoResponse, ServersResponse, SocketPacket, SocketPacketBody,
-            SocketPacketType, StatusResponse, SubscribeMessage, WriteRequest, WriteResponse,
-            PROTOCOL_VERSION, SERVER_VERSION,
+            AssetContainer, AssetFile, AssetFileChange, AssetGroup, AssetMatch, AssetPlanEntry,
+            AssetSynced, AssetWriteFailure, AssetsAckRequest, AssetsApplyRequest,
+            AssetsGroupsRequest, AssetsKnownRequest, AssetsKnownResponse, AssetsOkResponse,
+            AssetsPlanRequest, AssetsPlanResponse, AssetsReadRequest, AssetsReadResponse,
+            AssetsResponse, AssetsSessionRequest, AssetsSocketPacket, AssetsStageRequest,
+            AssetsWriteRequest, AssetsWriteResponse, ErrorResponse, Instance, MessagesPacket,
+            OpenResponse, ReadResponse, ServerInfoResponse, ServersResponse, SocketPacket,
+            SocketPacketBody, SocketPacketType, StatusResponse, SubscribeMessage, WriteRequest,
+            WriteResponse, PROTOCOL_VERSION, SERVER_VERSION,
         },
         origin::canonical,
         util::{deserialize_msgpack, json, msgpack, msgpack_ok, serialize_msgpack},
@@ -916,6 +916,14 @@ fn handle_assets_plan(
                 path: entry.path,
                 action: entry.action,
                 reason: entry.reason,
+            })
+            .collect(),
+        matches: plan
+            .matches
+            .into_iter()
+            .map(|found| AssetMatch {
+                studio: found.studio,
+                file: found.file,
             })
             .collect(),
     })

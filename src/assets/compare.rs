@@ -14,6 +14,10 @@
 //! - Studio works some properties out from an instance's other properties
 //!   some time after loading it, like the `TexturePack` of a
 //!   `SurfaceAppearance`, and gives them a new value every time it does.
+//! - Studio updates move properties that hold the ID of an asset as a string,
+//!   like `MeshId`, to properties that hold it as content, like `MeshContent`.
+//!   A file from before such an update has the one and Studio's version the
+//!   other, with the same asset in it.
 //!
 //! - New versions of Studio start saving properties that older ones didn't,
 //!   like `InputSinkEnabled` of GUIs. Every asset with that kind of instance
@@ -127,6 +131,93 @@ pub enum Properties {
     Shared,
 }
 
+/// The names of the content property that a string property holding the ID
+/// of an asset may have been moved to: `MeshId` became `MeshContent`,
+/// `TextureID` became `TextureContent`, and `Texture` did too.
+fn moved_content_names(string_property: &[u8]) -> Vec<Vec<u8>> {
+    let mut names = vec![[string_property, b"Content"].concat()];
+
+    for suffix in [&b"Id"[..], b"ID"] {
+        if let Some(stem) = string_property.strip_suffix(suffix) {
+            names.push([stem, b"Content"].concat());
+        }
+    }
+
+    // The one that got another name altogether.
+    if string_property == b"SoundId" {
+        names.push(b"AudioContent".to_vec());
+    }
+
+    names
+}
+
+/// Makes the string properties of `strings` that Studio moved to content
+/// properties in `contents` stand for those properties.
+fn align_moved_content_of<'a>(strings: &mut Model<'a>, contents: &Model<'a>) {
+    for class in &mut strings.classes {
+        let Some(other) = contents
+            .classes
+            .iter()
+            .find(|other| other.name == class.name)
+        else {
+            continue;
+        };
+
+        let mut moved = Vec::new();
+        for (index, column) in class.columns.iter().enumerate() {
+            // A property both have was moved in neither.
+            if column.value_type != STRING
+                || column.string_as_content
+                || other.columns.iter().any(|other| other.name == column.name)
+            {
+                continue;
+            }
+
+            let target = moved_content_names(column.name)
+                .into_iter()
+                .find_map(|name| {
+                    other
+                        .columns
+                        .iter()
+                        .find(|other| other.name == name.as_slice() && other.value_type == CONTENT)
+                })
+                // A model with both properties has the content already.
+                .filter(|target| class.columns.iter().all(|own| own.name != target.name));
+
+            if let Some(target) = target {
+                moved.push((index, target.name));
+            }
+        }
+
+        if moved.is_empty() {
+            continue;
+        }
+
+        for (index, name) in moved {
+            let column = &mut class.columns[index];
+            column.name = name;
+            column.value_type = CONTENT;
+            column.string_as_content = true;
+        }
+        // Properties are paired up by going through them in order.
+        class.columns.sort_by(|a, b| a.name.cmp(b.name));
+    }
+}
+
+/// Makes string properties that hold the ID of an asset stand for the content
+/// properties that the other model has in their place, so that the two are
+/// compared as the same property.
+///
+/// Studio updates move such properties, which makes a file from before the
+/// update and Studio's version of it differ in which properties they have,
+/// while the asset they refer to is the same. Left alone, neither property
+/// is compared with anything, and a different mesh or animation goes
+/// unnoticed.
+fn align_moved_content<'a>(a: &mut Model<'a>, b: &mut Model<'a>) {
+    align_moved_content_of(a, b);
+    align_moved_content_of(b, a);
+}
+
 /// How the properties an asset file has relate to the ones Studio's version
 /// of it has, apart from the ones Studio works out on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +285,7 @@ pub fn compare(
 
     file.drop_derived_properties();
     studio.drop_derived_properties();
+    align_moved_content(&mut file, &mut studio);
     let property_sets = property_sets(&file, &studio);
     if properties == Properties::Shared {
         keep_shared_properties(&mut file, &mut studio);
@@ -351,6 +443,10 @@ struct Column<'a> {
     refs: Vec<Option<usize>>,
     /// The values of Content properties, which are spread over several lists.
     contents: Vec<ContentValue<'a>>,
+    /// Whether this is a string property that stands for the content property
+    /// Studio moved it to, whose name and type it has taken on. Its values
+    /// are still stored as strings. See [`align_moved_content`].
+    string_as_content: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -952,6 +1048,7 @@ impl<'a> Column<'a> {
             starts: Vec::new(),
             refs: Vec::new(),
             contents: Vec::new(),
+            string_as_content: false,
         };
         let mut reader = Reader::new(data);
         let starts = &mut column.starts;
@@ -1119,6 +1216,19 @@ impl<'a> Column<'a> {
         let array = |index: usize| self.array(data, index);
         let value = || self.value(position);
 
+        if self.string_as_content {
+            // The ID of an asset as a string, which is the URI of the content
+            // it became. Strings are stored with their length first.
+            let uri = &value()[4..];
+            if uri.is_empty() {
+                out.push(Field::Small([0; 8]));
+            } else {
+                out.push(Field::Small([1, 0, 0, 0, 0, 0, 0, 0]));
+                out.push(Field::Bytes(uri));
+            }
+            return;
+        }
+
         match self.value_type {
             BOOL | FACES | AXES => out.push(Field::Bytes(&data[position..position + 1])),
             INT32 | BRICK_COLOR | ENUM => {
@@ -1211,6 +1321,8 @@ impl<'a> Column<'a> {
             STRING | FONT => out.push(Field::Bytes(value())),
             CONTENT => match self.contents[position] {
                 ContentValue::None => out.push(Field::Small([0; 8])),
+                // No asset, which a string says with an empty one.
+                ContentValue::Uri([]) => out.push(Field::Small([0; 8])),
                 ContentValue::Uri(uri) => {
                     out.push(Field::Small([1, 0, 0, 0, 0, 0, 0, 0]));
                     out.push(Field::Bytes(uri));
@@ -2097,6 +2209,91 @@ mod test {
         // The textures that are packed are still compared.
         let other_texture = textured("rbxassetid://2", Some("rbxassetid://100"));
         assert!(!same(&packed, &other_texture));
+    }
+
+    /// A part that refers to a mesh the way Studio did before it moved the
+    /// property to content, or the way it does since.
+    ///
+    /// rbx_binary saves the properties of the instances that have these the
+    /// way newer versions of Studio do, so they're put on a part here, which
+    /// it doesn't know to have them and saves as they are.
+    fn meshed(mesh: &str, as_content: bool) -> Vec<u8> {
+        if as_content {
+            let content = if mesh.is_empty() {
+                Content::none()
+            } else {
+                Content::from_uri(mesh)
+            };
+            model(vec![("MeshContent", content.into())])
+        } else {
+            model(vec![("MeshId", mesh.into())])
+        }
+    }
+
+    #[test]
+    fn asset_ids_moved_to_content_are_the_same_property() {
+        let before = meshed("rbxassetid://1", false);
+        let after = meshed("rbxassetid://1", true);
+        assert!(same(&before, &after));
+        assert!(same(&after, &before));
+        // Neither has a property the other lacks.
+        assert_eq!(
+            compare(&before, &after, Properties::Shared).unwrap(),
+            PropertySets::Same
+        );
+
+        // No asset is an empty string or no content.
+        assert!(same(&meshed("", false), &meshed("", true)));
+
+        // Another asset is a difference, which only shows because the two
+        // properties are compared with each other.
+        let other = meshed("rbxassetid://2", true);
+        assert!(!same(&before, &other));
+        assert_eq!(
+            compare(&before, &other, Properties::Shared)
+                .unwrap_err()
+                .to_string(),
+            "Arm.Palm.MeshContent differs"
+        );
+        assert!(!same(&meshed("", false), &after));
+
+        // Other spellings of such properties.
+        for (string, content) in [
+            ("TextureID", "TextureContent"),
+            ("Texture", "TextureContent"),
+            ("AnimationId", "AnimationContent"),
+            ("SoundId", "AudioContent"),
+        ] {
+            let before = model(vec![(string, "rbxassetid://1".into())]);
+            let after = model(vec![(content, Content::from_uri("rbxassetid://1").into())]);
+            assert!(same(&before, &after), "{string} and {content}");
+        }
+
+        // A file with the string is still one that lacks a property, if
+        // Studio saves another one that it doesn't have. Bringing it up to
+        // date then gives it the content as well.
+        let newer = model(vec![
+            ("MeshContent", Content::from_uri("rbxassetid://1").into()),
+            ("PropertyFromNewerStudio", false.into()),
+        ]);
+        assert_eq!(
+            compare(&before, &newer, Properties::Shared).unwrap(),
+            PropertySets::StudioHasMore
+        );
+        assert_eq!(
+            compare(&newer, &before, Properties::Shared).unwrap(),
+            PropertySets::Other
+        );
+
+        // Properties that only look alike stay two properties.
+        let string = model(vec![("Mesh", "rbxassetid://1".into())]);
+        let unrelated = model(vec![(
+            "ShapeContent",
+            Content::from_uri("rbxassetid://1").into(),
+        )]);
+        assert!(!same(&string, &unrelated));
+        let not_content = model(vec![("MeshContent", "rbxassetid://1".into())]);
+        assert!(!same(&before, &not_content));
     }
 
     #[test]

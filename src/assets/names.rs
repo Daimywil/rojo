@@ -333,6 +333,21 @@ fn sort_key(component: &str, is_file: bool) -> (Vec<u8>, u32) {
     (collision_key(base), number.unwrap_or(1))
 }
 
+/// A key that's the same for asset paths that only differ by the dedup
+/// suffixes of the files and directories in them, like `Maps/Tree.rbxm` and
+/// `Maps~2/Tree~3.rbxm`. Those are what instances with the same names in the
+/// same place are stored in.
+pub fn family_key(path: &str) -> Vec<Vec<u8>> {
+    let mut components = path.split('/').peekable();
+    let mut key = Vec::new();
+
+    while let Some(component) = components.next() {
+        key.push(sort_key(component, components.peek().is_none()).0);
+    }
+
+    key
+}
+
 /// Orders asset paths so that siblings that only differ by their dedup suffix
 /// are in suffix order (`Tree`, `Tree~2`, ..., `Tree~10`). The plugin gives
 /// siblings their suffixes in the order they're in, so instances created in
@@ -384,6 +399,19 @@ pub fn keys_at_or_under<'a, V>(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn family_keys_ignore_dedup_suffixes_and_case() {
+        let key = family_key("Maps/Tree.rbxm");
+        assert_eq!(key, family_key("Maps~2/Tree~3.rbxm"));
+        assert_eq!(key, family_key("maps/TREE~2.rbxm"));
+
+        assert_ne!(key, family_key("Maps/Trees.rbxm"));
+        assert_ne!(key, family_key("Tree.rbxm"));
+        assert_ne!(key, family_key("Maps/Sub/Tree.rbxm"));
+        // Only a number of two or more is a dedup suffix.
+        assert_ne!(key, family_key("Maps/Tree~x.rbxm"));
+    }
 
     // These cases are mirrored in plugin/src/AssetSync/names.spec.lua.
     const ENCODE_CASES: &[(&str, &str)] = &[

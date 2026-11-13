@@ -409,6 +409,22 @@ pub struct AssetsPlanResponse {
     /// previous sync to compare against, both sides are simply merged, which
     /// clients may want to confirm first.
     pub first_sync: bool,
+    /// Assets Studio has that are the same asset as a file, though the place
+    /// never synced either and the client gave them another path. If there
+    /// are any, the client should give those assets the paths of their files
+    /// and plan again, or both sides end up with two of each.
+    #[serde(default)]
+    pub matches: Vec<AssetMatch>,
+}
+
+/// An asset in Studio and the file that holds the same asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetMatch {
+    /// The path the client gave Studio's asset.
+    pub studio: String,
+    /// The path of the file.
+    pub file: String,
 }
 
 /// An asset serialized by Studio.

@@ -469,6 +469,78 @@ fn places_can_leave_files_from_before_a_studio_update_alone() {
 }
 
 #[test]
+fn assets_studio_and_the_files_both_have_are_not_duplicated() {
+    with_assets(|session, assets| {
+        // The place synced something before, so it isn't new to the server.
+        let old = studio_model("Old", 0.0);
+        let response = assets.write(vec![write_op("Old.rbxm", old.clone())]);
+        assert!(response.failures.is_empty());
+
+        // An asset got into Studio without being synced, like through Team
+        // Create, and its file arrived through git. The plugin has no way to
+        // tell that the two belong together, so it gives Studio's asset a
+        // path that leaves the file alone.
+        let wave = studio_model("Wave", 0.5);
+        let cursor = session.get_api_assets().unwrap().message_cursor;
+        let file = session.path().join("assets").join("Wave.rbxm");
+        fs::write(&file, stored_model("Wave", 0.5)).unwrap();
+        session.get_api_assets_socket_change(cursor).unwrap();
+
+        let stage = |path: &str| {
+            let _: AssetsOkResponse = session.post_api_assets(
+                "stage",
+                &AssetsStageRequest {
+                    session_id: assets.session_id,
+                    client_id: "studio".to_owned(),
+                    container: assets.container,
+                    assets: vec![AssetContents {
+                        path: path.to_owned(),
+                        data: wave.clone(),
+                    }],
+                },
+            );
+        };
+        let studio = |wave_path: &str| {
+            vec![
+                AssetHash {
+                    path: "Old.rbxm".to_owned(),
+                    hash: hash(&old),
+                },
+                AssetHash {
+                    path: wave_path.to_owned(),
+                    hash: hash(&wave),
+                },
+            ]
+        };
+
+        assert_eq!(
+            assets.plan("1", studio("Wave~2.rbxm")).need_upload,
+            vec!["Wave~2.rbxm".to_owned()]
+        );
+        stage("Wave~2.rbxm");
+
+        // Going by their paths, each would be copied to the other side. The
+        // server says that they're the same asset instead.
+        let plan = assets.plan("1", studio("Wave~2.rbxm"));
+        assert_eq!(plan.matches.len(), 1);
+        assert_eq!(plan.matches[0].studio, "Wave~2.rbxm");
+        assert_eq!(plan.matches[0].file, "Wave.rbxm");
+
+        // With the path of its file, Studio's asset is simply in sync.
+        assert_eq!(
+            assets.plan("1", studio("Wave.rbxm")).need_upload,
+            vec!["Wave.rbxm".to_owned()]
+        );
+        stage("Wave.rbxm");
+        let plan = assets.plan("1", studio("Wave.rbxm"));
+        assert!(plan.need_upload.is_empty());
+        assert!(plan.actions.is_empty());
+        assert!(plan.matches.is_empty());
+        assert!(!session.path().join("assets").join("Wave~2.rbxm").exists());
+    });
+}
+
+#[test]
 fn known_assets_list_what_a_place_synced() {
     with_assets(|session, assets| {
         let tree = studio_model("Tree", 0.0);

@@ -377,6 +377,76 @@ return function()
 
 			container:Destroy()
 		end)
+
+		it("should give assets the files they turn out to be without having synced them", function()
+			local container = make("Folder", "Assets")
+			local wave = make("Animation", "Wave", container)
+			local skills = make("Folder", "Skills", container)
+			local punch = make("Animation", "Punch", skills)
+			local gear = make("Folder", "Gear5", skills)
+			local main = make("Animation", "Main", gear)
+			local chair = make("Folder", "Chair", container)
+			local default = make("Folder", "Default", chair)
+			local seat = make("MeshPart", "Chair", default)
+			local hashes = { [wave] = hash("w"), [punch] = hash("p"), [main] = hash("m"), [seat] = hash("s") }
+
+			-- The place only ever synced the punch. Everything else got into
+			-- Studio some other way, like through Team Create, and its files
+			-- arrived through git.
+			local synced = { { path = "Skills/Punch.rbxm", hashes = { short("p") } } }
+			local files = { "Skills/Punch.rbxm", "Wave.rbxm", "Skills/Gear5/Main.rbxm", "Chair/Default/Chair.rbxm" }
+
+			-- Nothing tells that those assets are those files, so they keep
+			-- out of each other's way.
+			local layout = Layout.compute(container, emptyInstanceMap(), nil, nil, Layout.hints(synced, files, hashes))
+			expect(layout.units["Skills/Punch.rbxm"]).to.equal(punch)
+			expect(layout.units["Wave~2.rbxm"]).to.equal(wave)
+			expect(layout.units["Skills/Gear5~2/Main.rbxm"]).to.equal(main)
+			expect(layout.units["Chair~2/Default/Chair.rbxm"]).to.equal(seat)
+
+			-- Once the server found them to be the same, the files count as
+			-- synced with what the assets serialize to, which gives every
+			-- asset its file and every folder its directory.
+			table.insert(synced, { path = "Wave.rbxm", hashes = { short("w") } })
+			table.insert(synced, { path = "Skills/Gear5/Main.rbxm", hashes = { short("m") } })
+			table.insert(synced, { path = "Chair/Default/Chair.rbxm", hashes = { short("s") } })
+
+			layout = Layout.compute(container, emptyInstanceMap(), nil, nil, Layout.hints(synced, files, hashes))
+			expect(layout.units["Skills/Punch.rbxm"]).to.equal(punch)
+			expect(layout.units["Wave.rbxm"]).to.equal(wave)
+			expect(layout.units["Skills/Gear5/Main.rbxm"]).to.equal(main)
+			expect(layout.units["Chair/Default/Chair.rbxm"]).to.equal(seat)
+			expect(layout.directories["Skills/Gear5"]).to.equal(gear)
+			expect(layout.directories["Chair"]).to.equal(chair)
+			expect(layout.directories["Chair/Default"]).to.equal(default)
+
+			local count = 0
+			for _ in layout.units do
+				count += 1
+			end
+			expect(count).to.equal(4)
+
+			container:Destroy()
+		end)
+
+		it("should only give one of two identical assets the file they both match", function()
+			local container = make("Folder", "Assets")
+			local first = make("Animation", "Wave", container)
+			local second = make("Animation", "Wave", container)
+			local old = make("Animation", "Old", container)
+			local hashes = { [first] = hash("w"), [second] = hash("w"), [old] = hash("o") }
+
+			local hints = Layout.hints({
+				{ path = "Old.rbxm", hashes = { short("o") } },
+				{ path = "Wave.rbxm", hashes = { short("w") } },
+			}, { "Old.rbxm", "Wave.rbxm" }, hashes)
+
+			local layout = Layout.compute(container, emptyInstanceMap(), nil, nil, hints)
+			expect(layout.units["Wave.rbxm"]).to.equal(first)
+			expect(layout.units["Wave~2.rbxm"]).to.equal(second)
+
+			container:Destroy()
+		end)
 	end)
 
 	it("should find parent paths", function()

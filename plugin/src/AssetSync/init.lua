@@ -58,6 +58,9 @@ local RETRY_DELAY = 3
 -- Files can only not be read while another program is still writing them,
 -- which rarely takes more than a moment.
 local MAX_FILE_RETRIES = 10
+-- How often the initial sync gives assets the paths of files the server found
+-- them to be, and plans again. Once is enough unless more turn up.
+local MAX_MATCH_ROUNDS = 3
 -- How long work spread over frames may run before Studio gets to draw one.
 local FRAME_WORK_BUDGET = 0.008
 -- How often the count of a step of the initial sync is updated at most, since
@@ -503,8 +506,9 @@ type Group = {
 --[[
 	Computes the layout of a container at the start of a session, so that every
 	asset gets the file it had before, and finds out what every asset in it
-	serializes to. Returns the layout, what every unit serializes to, and the
-	groups the units were serialized in.
+	serializes to. Returns the layout, what every unit serializes to, the
+	groups the units were serialized in, and what's known about the files, to
+	compute the layout again with (see __layoutWithMatches).
 
 	Serializing every asset on its own is most of the time this takes, so
 	assets are serialized in groups first. A group whose hash is the same as
@@ -618,7 +622,50 @@ function AssetSync:__initialLayout(container): (Layout.Layout, { [Instance]: ser
 		serializeInto(results, added)
 	end
 
-	return layout, results, groups
+	return layout, results, groups, { synced = synced, files = known.files, firstSync = hints.firstSync }
+end
+
+--[[
+	Computes the layout again, now that the server found assets in Studio to
+	be files that this place never synced.
+
+	An asset gets into Studio without being synced through Team Create, or
+	when the place is published from another one. If its file arrives as well,
+	nothing about their names tells that the two belong together, so the asset
+	got a path that leaves the file alone. Syncing that way copies each to the
+	other side, and there are two of the asset from then on.
+
+	The files are added to what the place is known to have synced, as synced
+	with what their assets serialize to, which is what gives an asset its file.
+	`matches` lists the path of each file and the hash of its asset.
+]]
+function AssetSync:__layoutWithMatches(container, known, results, matches: { { path: string, hash: string } })
+	for _, match in matches do
+		table.insert(known.synced, { path = match.path, hashes = { string.sub(match.hash, 1, 16) } })
+	end
+
+	local hashes = {}
+	for instance, result in results do
+		hashes[instance] = result.hash
+	end
+
+	local hints = Layout.hints(known.synced, known.files, hashes, frameBudget(FRAME_WORK_BUDGET))
+	-- A place that never synced still names everything else after the files.
+	hints.firstSync = known.firstSync
+	local layout = Layout.compute(container.instance, self.__instanceMap, nil, nil, hints)
+
+	-- That yields, so instances may have been added in the meantime.
+	local added = {}
+	for _, instance in layout.units do
+		if results[instance] == nil then
+			table.insert(added, instance)
+		end
+	end
+	if #added > 0 then
+		serializeInto(results, added)
+	end
+
+	return layout
 end
 
 --[[
@@ -668,60 +715,127 @@ end
 
 function AssetSync:__initialSync(container)
 	local started = os.clock()
-	local layout, results, groups = self:__initialLayout(container)
+	local layout, results, groups, known = self:__initialLayout(container)
 
-	local serialized = {}
-	local skipped = {}
-	local count = 0
+	-- What every asset serializes to by its path, the paths of the ones that
+	-- couldn't be serialized, and how many assets there are. They follow from
+	-- the layout, which may be computed more than once.
+	local serialized, skipped, count
+	local warned = {}
+	local function index()
+		serialized, skipped, count = {}, {}, 0
 
-	for path, instance in layout.units do
-		count += 1
-		local result = results[instance]
-		if result.hash ~= nil then
-			serialized[path] = result
-		else
-			table.insert(skipped, path)
-			Log.warn("Could not serialize asset {}: {}", instance:GetFullName(), result.err)
+		for path, instance in layout.units do
+			count += 1
+			local result = results[instance]
+			if result.hash ~= nil then
+				serialized[path] = result
+			else
+				table.insert(skipped, path)
+				if not warned[instance] then
+					warned[instance] = true
+					Log.warn("Could not serialize asset {}: {}", instance:GetFullName(), result.err)
+				end
+			end
 		end
 	end
 
-	local function hashes()
-		local list = {}
+	-- Assets that were serialized again to upload them may have changed since
+	-- their group was hashed, in which case that hash doesn't stand for what
+	-- they are now. This remembers which ones did, and what every asset that
+	-- was serialized again serializes to.
+	local regrouped = {}
+	local function adopt()
 		for path, result in serialized do
-			table.insert(list, { path = path, hash = buffer.fromstring(result.hash) })
+			local instance = layout.units[path]
+			local grouped = if instance ~= nil then results[instance] else nil
+			if grouped ~= nil and grouped ~= result then
+				if grouped.hash ~= result.hash then
+					regrouped[instance] = true
+				end
+				results[instance] = result
+			end
 		end
-		return list
 	end
 
-	self:__progress(container, "Comparing with the files")
-	local planRequest = {
-		clientId = self.__clientId,
-		placeId = self.__placeId,
-		session = self.__placeSession,
-		container = container.id,
-		assets = hashes(),
-		skipped = skipped,
-		upgradeFiles = self.__upgradeFiles,
-	}
-
-	local plan = self.__apiContext:assetsPlan(planRequest):expect()
-	if #plan.needUpload > 0 then
-		Log.debug("Uploading {} assets to compare them", #plan.needUpload)
-		self:__progress(container, "Uploading assets to compare them")
-
-		-- Serializing these again may find that they changed in the meantime,
-		-- so the plan is made with their latest hashes.
-		serializeMissing(plan.needUpload, serialized, layout.units)
-		planRequest.assets = hashes()
-
-		self:__upload(container, plan.needUpload, serialized)
-		plan = self.__apiContext:assetsPlan(planRequest):expect()
-
-		if #plan.needUpload > 0 then
-			-- Everything that was asked for was uploaded, so this should never
-			-- happen. These assets are left alone until they change again.
-			Log.warn("The Rojo server still needs {} assets after uploading them", #plan.needUpload)
+	local function makePlan()
+		local function hashes()
+			local list = {}
+			for path, result in serialized do
+				table.insert(list, { path = path, hash = buffer.fromstring(result.hash) })
+			end
+			return list
 		end
+
+		self:__progress(container, "Comparing with the files")
+		local planRequest = {
+			clientId = self.__clientId,
+			placeId = self.__placeId,
+			session = self.__placeSession,
+			container = container.id,
+			assets = hashes(),
+			skipped = skipped,
+			upgradeFiles = self.__upgradeFiles,
+		}
+
+		local plan = self.__apiContext:assetsPlan(planRequest):expect()
+		if #plan.needUpload > 0 then
+			Log.debug("Uploading {} assets to compare them", #plan.needUpload)
+			self:__progress(container, "Uploading assets to compare them")
+
+			-- Serializing these again may find that they changed in the
+			-- meantime, so the plan is made with their latest hashes.
+			serializeMissing(plan.needUpload, serialized, layout.units)
+			planRequest.assets = hashes()
+
+			self:__upload(container, plan.needUpload, serialized)
+			plan = self.__apiContext:assetsPlan(planRequest):expect()
+
+			if #plan.needUpload > 0 then
+				-- Everything that was asked for was uploaded, so this should
+				-- never happen. These assets are left alone until they change
+				-- again.
+				Log.warn("The Rojo server still needs {} assets after uploading them", #plan.needUpload)
+			end
+		end
+
+		return plan
+	end
+
+	index()
+	local plan = makePlan()
+
+	-- Some of Studio's assets may turn out to be files this place never
+	-- synced, which only shows once the server compared them. They're given
+	-- the paths of their files before anything is synced, or each would be
+	-- copied to the other side as if they were two assets. Servers that don't
+	-- look for them never report any.
+	for _ = 1, MAX_MATCH_ROUNDS do
+		if plan.matches == nil or #plan.matches == 0 then
+			break
+		end
+
+		local matches = {}
+		for _, match in plan.matches do
+			local result = serialized[match.studio]
+			if result ~= nil then
+				table.insert(matches, { path = match.file, hash = result.hash })
+			end
+		end
+		if #matches == 0 then
+			break
+		end
+
+		Log.info(
+			"{} assets in {} are already in Studio and on disk, though this place didn't sync them before",
+			#matches,
+			container.path
+		)
+
+		adopt()
+		layout = self:__layoutWithMatches(container, known, results, matches)
+		index()
+		plan = makePlan()
 	end
 
 	local toFs, deleteFs, toStudio, deleteStudio, conflicts = {}, {}, {}, {}, {}
@@ -841,18 +955,9 @@ function AssetSync:__initialSync(container)
 		end
 	end
 
-	-- Assets that were serialized again to upload them may have changed since
-	-- their group was hashed, in which case that hash doesn't stand for what
-	-- they are now.
-	for path, result in serialized do
-		local instance = layout.units[path]
-		local grouped = if instance ~= nil then results[instance] else nil
-		if grouped ~= nil and grouped ~= result then
-			if grouped.hash ~= result.hash then
-				replaced[instance] = true
-			end
-			results[instance] = result
-		end
+	adopt()
+	for instance in regrouped do
+		replaced[instance] = true
 	end
 
 	if #toStudio > 0 or #deleteStudio > 0 then

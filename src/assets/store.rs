@@ -115,6 +115,29 @@ pub struct PlanResult {
     /// Whether this place has never synced this container before, meaning
     /// nothing is known about which side changed what.
     pub first_sync: bool,
+
+    /// Assets Studio has that turned out to be files the place never synced,
+    /// though Studio gave them other paths. See [`AssetMatch`].
+    pub matches: Vec<AssetMatch>,
+}
+
+/// An asset in Studio and a file that are the same asset, though the place
+/// never synced either and they have different paths.
+///
+/// An asset can get into Studio without being synced: through Team Create,
+/// or because the place was published from another one. A place that then
+/// gets the asset's file as well has both, with no telling from their names
+/// that they belong together, so the plugin gives Studio's asset a path that
+/// doesn't take the file's. Going by paths alone, both are new, and each
+/// would be copied to the other side, leaving two of the asset on both.
+/// Clients are told about these instead, to give Studio's asset the path of
+/// its file and plan again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetMatch {
+    /// The path Studio gave its asset.
+    pub studio: String,
+    /// The path of the file that holds the same asset.
+    pub file: String,
 }
 
 /// An asset file read for a client.
@@ -1254,9 +1277,22 @@ impl AssetStore {
         };
         let mut agreed = Vec::new();
 
+        // Assets and files that are new to the place, and that only one side
+        // has at their path.
+        let mut studio_only = Vec::new();
+        let mut file_only = Vec::new();
+
         for path in paths {
             if skipped.contains(path) {
                 continue;
+            }
+
+            if !bases.contains_key(path) {
+                match (studio_map.contains_key(path), files.contains_key(path)) {
+                    (true, false) if uploaded(path).is_some() => studio_only.push(path),
+                    (false, true) => file_only.push(path),
+                    _ => {}
+                }
             }
 
             let sides = AssetSides {
@@ -1303,6 +1339,57 @@ impl AssetStore {
                     action,
                     reason,
                 }),
+            }
+        }
+
+        // An asset only Studio has and a file only the filesystem has can
+        // still be the same asset, if their paths only differ by the suffixes
+        // that tell same-named siblings apart (see `AssetMatch`). Whether they
+        // are shows in their contents.
+        let mut unsynced_files: HashMap<Vec<Vec<u8>>, Vec<&str>> = HashMap::new();
+        for &path in &file_only {
+            unsynced_files
+                .entry(names::family_key(path))
+                .or_default()
+                .push(path);
+        }
+
+        let same_assets: Vec<(&str, Vec<&str>)> = studio_only
+            .into_par_iter()
+            .filter_map(|path| {
+                let staged = uploaded(path)?;
+                let same: Vec<&str> = unsynced_files
+                    .get(&names::family_key(path))?
+                    .iter()
+                    .copied()
+                    .filter(|&file| {
+                        let entry = &files[file];
+                        entry.hash == staged.canonical_hash
+                            || root.as_deref().is_some_and(|root| {
+                                file_only_differs_by_noise(
+                                    root,
+                                    file,
+                                    &entry.hash,
+                                    &staged.raw,
+                                    Properties::Shared,
+                                )
+                                .is_some()
+                            })
+                    })
+                    .collect();
+                Some((path, same))
+            })
+            .collect();
+
+        // Every file is one asset, however many of Studio's it matches.
+        let mut matched = HashSet::new();
+        for (path, same) in same_assets {
+            if let Some(file) = same.into_iter().find(|&file| matched.insert(file)) {
+                log::debug!("Studio's {path} is the same asset as the file {file}");
+                result.matches.push(AssetMatch {
+                    studio: path.to_owned(),
+                    file: file.to_owned(),
+                });
             }
         }
 
@@ -2727,7 +2814,8 @@ mod test {
 
     /// Replaces an asset file the way `git checkout` does.
     fn replace_file(fixture: &Fixture, path: &str, model: &[u8]) {
-        let absolute = fixture.assets.join(path);
+        let absolute = absolute_path(&fixture.assets, path);
+        fs::create_dir_all(absolute.parent().unwrap()).unwrap();
         fs::write(&absolute, rbxm::canonicalize(model).unwrap()).unwrap();
         assert!(fixture.store.handle_fs_change(&absolute));
     }
@@ -2908,6 +2996,132 @@ mod test {
             fs::read(&path).unwrap(),
             rbxm::canonicalize(&edited).unwrap()
         );
+    }
+
+    /// Uploads Studio's version of the given assets and plans a sync with
+    /// exactly those in Studio.
+    fn plan_all_with_upload(
+        fixture: &Fixture,
+        place: &str,
+        assets: &[(&str, &[u8])],
+    ) -> PlanResult {
+        let studio: Vec<(String, Hash)> = assets
+            .iter()
+            .map(|(path, model)| (path.to_string(), hash_bytes(model)))
+            .collect();
+        fixture
+            .store
+            .stage(
+                "client",
+                fixture.container,
+                assets
+                    .iter()
+                    .map(|(path, model)| (path.to_string(), model.to_vec()))
+                    .collect(),
+            )
+            .unwrap();
+        fixture
+            .store
+            .plan("client", place, None, fixture.container, &studio, &[])
+            .unwrap()
+    }
+
+    fn asset_match(studio: &str, file: &str) -> AssetMatch {
+        AssetMatch {
+            studio: studio.to_owned(),
+            file: file.to_owned(),
+        }
+    }
+
+    #[test]
+    fn assets_both_sides_got_without_syncing_are_matched_up() {
+        let fixture = fixture();
+        let old = studio_model("Old", 0.0);
+        fixture
+            .store
+            .write(
+                "client",
+                "1",
+                fixture.container,
+                vec![write_op("Old.rbxm", old.clone())],
+            )
+            .unwrap();
+
+        // The place got new assets without syncing them, for example because
+        // it was published from another place, and their files arrived
+        // through git. The plugin can't tell that they belong together, so it
+        // gave Studio's assets paths that leave the files alone.
+        let wave = studio_model("Wave", 0.0);
+        replace_file(&fixture, "Wave.rbxm", &wave);
+        let main = studio_model("Main", 0.5);
+        replace_file(&fixture, "Skills/Gear5/Main.rbxm", &main);
+
+        let plan = plan_all_with_upload(
+            &fixture,
+            "1",
+            &[
+                ("Old.rbxm", &old),
+                ("Wave~2.rbxm", &wave),
+                ("Skills/Gear5~2/Main.rbxm", &main),
+            ],
+        );
+        assert_eq!(
+            plan.matches,
+            vec![
+                asset_match("Skills/Gear5~2/Main.rbxm", "Skills/Gear5/Main.rbxm"),
+                asset_match("Wave~2.rbxm", "Wave.rbxm"),
+            ]
+        );
+
+        // Once the plugin gave them the paths of their files, they're in
+        // sync, with nothing written and nothing added to Studio.
+        let plan = plan_all_with_upload(
+            &fixture,
+            "1",
+            &[
+                ("Old.rbxm", &old),
+                ("Wave.rbxm", &wave),
+                ("Skills/Gear5/Main.rbxm", &main),
+            ],
+        );
+        assert_in_sync(&plan);
+        assert_eq!(plan.matches, Vec::new());
+        assert!(!fixture.assets.join("Wave~2.rbxm").exists());
+        assert!(!fixture.assets.join("Skills").join("Gear5~2").exists());
+    }
+
+    #[test]
+    fn only_assets_with_the_same_contents_are_matched_up() {
+        let fixture = fixture();
+        let wave = studio_model("Wave", 0.0);
+        replace_file(&fixture, "Wave.rbxm", &wave);
+        replace_file(&fixture, "Maps/Wave.rbxm", &wave);
+
+        // Another asset that happens to have the same name stays another
+        // asset, and so does the same asset somewhere else.
+        let other = studio_model("Wave", 0.5);
+        let plan = plan_all_with_upload(
+            &fixture,
+            "1",
+            &[("Wave~2.rbxm", &other), ("Props/Wave.rbxm", &wave)],
+        );
+        assert_eq!(plan.matches, Vec::new());
+        assert_eq!(plan.actions.len(), 4);
+
+        // A file is one asset, so only one of two copies of it in Studio is
+        // matched with it. The other one is new.
+        let plan = plan_all_with_upload(
+            &fixture,
+            "1",
+            &[("Wave~2.rbxm", &wave), ("Wave~3.rbxm", &wave)],
+        );
+        assert_eq!(plan.matches, vec![asset_match("Wave~2.rbxm", "Wave.rbxm")]);
+
+        // Studio saving the asset differently on its own doesn't make it
+        // another asset, like a property a newer version of Studio saves.
+        let newer = newer_studio_model("Wave", 0.0, false);
+        let plan = plan_all_with_upload(&fixture, "1", &[("Wave~2.rbxm", &newer)]);
+        assert_eq!(plan.matches, vec![asset_match("Wave~2.rbxm", "Wave.rbxm")]);
     }
 
     #[test]
